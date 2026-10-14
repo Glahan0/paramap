@@ -93,15 +93,42 @@ So on this setup: **about two thirds of the weight VRAM freed for under a third
 of the speed.** At full streaming the runtime reaches 94% of the bus-imposed
 ceiling, meaning the prefetch pipeline leaves little on the table.
 
+### Qwen2.5-3B-Instruct
+
+bf16, 5.75 GB of weights, same RTX 3060, PCIe at 13.4 GB/s with pinned memory.
+Each streamed layer is 154 MB. "Bus use" is streamed bytes per token × tokens/s
+divided by 13.4 GB/s:
+
+| Budget | Layers resident / streamed | Peak VRAM | VRAM saved | tokens/s | vs baseline | Bus use | Output |
+|---|---|---|---|---|---|---|---|
+| baseline | 36 / 0 | 5.87 GB | — | 18.6 | — | — | identical |
+| 5 GB | 27 / 9 | 4.84 GB | 17.5% | 7.8 | −57.9% | 81% | identical |
+| 4 GB | 20 / 16 | 3.82 GB | 34.9% | 5.1 | −72.4% | 94% | identical |
+| 3 GB | 13 / 23 | 2.79 GB | 52.4% | 3.7 | −80.3% | 98% | identical |
+| 2 GB | 6 / 30 | 1.77 GB | 69.9% | 2.9 | −84.7% | 100% | identical |
+| 1.5 GB | 3 / 33 | 1.33 GB | 77.4% | 2.6 | −86.0% | 99% | identical |
+| 1.15 GB | 0 / 36 | 909 MB | 84.9% | 2.3\* | −87.6% | 95% | identical |
+
+\* From a separate run with all 36 layers pinned. In the sweep, host RAM ran
+low, some layers fell back to pageable memory, and it measured 1.6 tokens/s.
+
+The saving grows with model size, as expected (85% vs 66%), because anchors are
+a smaller share. **But the speed cost grows too, and it is set by physics, not
+by the runtime.** The engine is at 94–100% of the bus ceiling, so
+
+    tokens/s ≤ PCIe bandwidth / bytes streamed per token
+
+and a 3B layer is 154 MB against a 0.5B layer's 18 MB. Streaming dense bf16
+weights over PCIe is a good trade when only a few layers have to move, and an
+expensive one when most of the model does.
+
 Two honest caveats:
 
 - **The floor is set by what cannot be streamed.** Embeddings and the output
-  head ("anchors") are touched every token and stay resident. On this 0.5 B
-  model they are 260 MB — 28% of it — which is why 331 MB is as low as it goes.
-  On larger models anchors are a much smaller share, so the achievable saving
-  is larger.
-- **These numbers are from one small model on one GPU.** Run `paramap bench` on
-  your own model and machine rather than trusting the table.
+  head ("anchors") are touched every token and stay resident: 260 MB on 0.5B
+  (28% of the model), 594 MB on 3B (10%).
+- **These numbers are from one GPU.** Run `paramap bench` on your own model and
+  machine rather than trusting the tables.
 
 ---
 

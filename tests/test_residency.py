@@ -279,3 +279,58 @@ def test_streaming_counts_what_it_moved():
     assert stats["streamed_layers"] == len(plan.streamed_layers)
     # Each streamed layer is fetched once per pass.
     assert stats["bytes_transferred"] == 2 * len(plan.streamed_layers) * plan.layer_bytes
+
+
+# ---------------------------------------------------------------------------
+# Page-locked host memory (CUDA only)
+# ---------------------------------------------------------------------------
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+def _streamed_host_tensors(streaming):
+    return [t for params in streaming._host_params.values() for t in params.values()]
+
+
+@needs_cuda
+@pytest.mark.parametrize("pin_reserve", ["0B", "1024GB"])
+def test_streaming_on_cuda_is_identical_pinned_or_not(pin_reserve):
+    """Pinned (async) and pageable (fallback) host copies must both be lossless."""
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    model = _TinyLM(num_layers=6).to(device)
+    model.eval()
+    input_ids = torch.randint(0, model.config.vocab_size, (1, 5), device=device)
+
+    with torch.no_grad():
+        expected = model(input_ids)
+
+    plan = _plan_for(model, resident_count=1)
+    with torch.no_grad():
+        with StreamingModel(model, plan, device=device, pin_reserve=pin_reserve) as streaming:
+            pinned = [t.is_pinned() for t in _streamed_host_tensors(streaming)]
+            for pass_index in range(3):
+                assert torch.equal(model(input_ids), expected), f"pass {pass_index} diverged"
+
+    if pin_reserve == "0B":
+        assert all(pinned), "streamed layers should be page-locked"
+    else:
+        assert not any(pinned), "a reserve larger than RAM must leave layers pageable"
+
+
+@needs_cuda
+def test_pinning_costs_exactly_the_streamed_bytes_and_is_released():
+    """No power-of-two rounding while streaming; no locked RAM left afterwards."""
+    device = torch.device("cuda")
+    model = _TinyLM(num_layers=6).to(device)
+    plan = _plan_for(model, resident_count=2)
+
+    with StreamingModel(model, plan, device=device, pin_reserve="0B") as streaming:
+        host = _streamed_host_tensors(streaming)
+        payload = sum(t.numel() * t.element_size() for t in host)
+        locked = sum(flat.numel() for flat in streaming._registered)
+        # Only per-tensor 512-byte alignment padding is allowed on top.
+        assert payload <= locked <= payload + 512 * len(host)
+
+    assert streaming._registered == []
+    assert not any(t.is_pinned() for t in host)

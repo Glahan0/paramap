@@ -173,6 +173,7 @@ def benchmark_budgets(
                 model, tokenizer, prompt, device, max_new_tokens=max_new_tokens
             )
             transferred = streaming.transfer_bytes_total
+            pinned_layers = streaming.stats()["pinned_layers"]
 
         identical = ids == baseline.generated_ids
         results.append(
@@ -189,8 +190,15 @@ def benchmark_budgets(
         )
         if verbose:
             verdict = "identical" if identical else "DIVERGED"
+            pinned_text = ""
+            if plan.streamed_layers and pinned_layers < len(plan.streamed_layers):
+                pinned_text = (
+                    f" | only {pinned_layers}/{len(plan.streamed_layers)} streamed layers "
+                    "pinned (host RAM low), so slower than the bus allows"
+                )
             print(
                 f"  {tps:6.1f} tok/s | peak VRAM {format_bytes(peak)} | output {verdict}"
+                f"{pinned_text}"
             )
 
     return results

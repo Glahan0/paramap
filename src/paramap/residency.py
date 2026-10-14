@@ -394,12 +394,17 @@ class StreamingModel:
         device: Optional[torch.device] = None,
         adapter: Optional[ModelArchAdapter] = None,
         pin_memory: bool = True,
+        pin_reserve: Any = "2GB",
     ):
         self.model = model
         self.plan = plan
         self.adapter = adapter or QwenArchitectureAdapter()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.pin_memory = pin_memory and self.device.type == "cuda"
+        self.pin_memory = pin_memory and self.device.type == "cuda" and torch.cuda.is_available()
+        # Host RAM that page-locking must leave available to the rest of the system.
+        self.pin_reserve_bytes = parse_bytes(pin_reserve)
+        # Flat host buffers page-locked with cudaHostRegister; unregistered on remove().
+        self._registered: List[torch.Tensor] = []
 
         self._layers = self.adapter.get_layers(model)
         self._installed = False
@@ -474,6 +479,13 @@ class StreamingModel:
                 if name in host:
                     param.data = host[name]
 
+        # Outside a plan the host copies are ordinary RAM again: page-locked
+        # memory is a system-wide cost, held only while streaming needs it.
+        # In-flight copies must finish before their source is unlocked.
+        if self.is_cuda:
+            torch.cuda.synchronize(self.device)
+        self._unregister_host_buffers()
+
         self._slots.clear()
         self._slot_ready.clear()
         self._slot_free.clear()
@@ -506,22 +518,20 @@ class StreamingModel:
 
     def _move_layer_to_host(self, layer_idx: int, layer: nn.Module) -> None:
         host: Dict[str, torch.Tensor] = {}
-        refs: Dict[str, nn.Parameter] = {}
+        refs: Dict[str, nn.Parameter] = dict(layer.named_parameters())
 
-        for name, param in layer.named_parameters():
-            tensor = param.data
-            if tensor.device.type != "cpu":
-                tensor = tensor.to("cpu")
-            if self.pin_memory and not tensor.is_pinned():
-                try:
-                    tensor = tensor.pin_memory()
-                except RuntimeError:
-                    # Pinning can fail when host RAM is tight; fall back to
-                    # pageable memory, which transfers synchronously but works.
-                    pass
-            host[name] = tensor
+        already_pinned = all(
+            p.data.device.type == "cpu" and p.data.is_pinned() for p in refs.values()
+        )
+        if self.pin_memory and not already_pinned:
+            host = self._pack_and_pin(refs)
+
+        for name, param in refs.items():
+            tensor = host.get(name)
+            if tensor is None:
+                tensor = param.data if param.data.device.type == "cpu" else param.data.to("cpu")
+                host[name] = tensor
             param.data = tensor
-            refs[name] = param
 
         # Buffers stay on the device: they are small and needed every token.
         for module in layer.modules():
@@ -531,6 +541,64 @@ class StreamingModel:
 
         self._host_params[layer_idx] = host
         self._param_refs[layer_idx] = refs
+
+    def _pack_and_pin(self, refs: Dict[str, nn.Parameter]) -> Dict[str, torch.Tensor]:
+        """
+        Copies one layer's parameters into a single exactly-sized host buffer
+        and page-locks it in place with cudaHostRegister.
+
+        `Tensor.pin_memory()` goes through PyTorch's caching host allocator,
+        which rounds every block up to a power of two: a 45 MB MLP matrix takes
+        64 MB, about +45% across a Qwen2.5-3B layer. Registering an ordinary
+        buffer pins exactly what is needed.
+
+        Page-locked memory cannot be swapped out, so pinning stops while it
+        would leave less than `pin_reserve_bytes` of RAM available; later
+        layers stay pageable, which still works but transfers more slowly.
+        Returns {} when the layer is left pageable.
+        """
+        alignment = 512
+        offsets: Dict[str, int] = {}
+        total = 0
+        for name, param in refs.items():
+            offsets[name] = total
+            nbytes = param.data.numel() * param.data.element_size()
+            total += -(-nbytes // alignment) * alignment
+
+        if total == 0 or not self._can_pin(total):
+            return {}
+
+        flat = torch.empty(total, dtype=torch.uint8)
+        host: Dict[str, torch.Tensor] = {}
+        for name, param in refs.items():
+            src = param.data
+            nbytes = src.numel() * src.element_size()
+            view = flat[offsets[name] : offsets[name] + nbytes].view(src.dtype).view(src.shape)
+            view.copy_(src)
+            host[name] = view
+
+        err = torch.cuda.cudart().cudaHostRegister(flat.data_ptr(), total, 0)
+        if err != torch.cuda.cudart().cudaError.success:
+            # The copy is still a valid pageable host buffer; use it as such.
+            return host
+
+        self._registered.append(flat)
+        return host
+
+    def _can_pin(self, nbytes: int) -> bool:
+        try:
+            import psutil
+        except ImportError:
+            return True
+        return psutil.virtual_memory().available - nbytes >= self.pin_reserve_bytes
+
+    def _unregister_host_buffers(self) -> None:
+        if not self._registered:
+            return
+        unregister = torch.cuda.cudart().cudaHostUnregister
+        for flat in self._registered:
+            unregister(flat.data_ptr())
+        self._registered.clear()
 
     def _allocate_slots(self) -> None:
         template_idx = self.plan.streamed_layers[0]
@@ -649,6 +717,13 @@ class StreamingModel:
             "installed": self._installed,
             "resident_layers": len(self.plan.resident_layers),
             "streamed_layers": len(self.plan.streamed_layers),
+            # Streamed layers whose host copy is page-locked; the rest transfer
+            # synchronously from pageable RAM and are slower.
+            "pinned_layers": sum(
+                1
+                for params in self._host_params.values()
+                if params and all(t.is_pinned() for t in params.values())
+            ),
             "staging_slots": self.plan.staging_slots,
             "forward_passes": self.tokens_observed,
             "bytes_transferred": self.transfer_bytes_total,
