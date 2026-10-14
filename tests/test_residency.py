@@ -334,3 +334,163 @@ def test_pinning_costs_exactly_the_streamed_bytes_and_is_released():
 
     assert streaming._registered == []
     assert not any(t.is_pinned() for t in host)
+
+
+# ---------------------------------------------------------------------------
+# Fast mode: computing layers on the CPU
+# ---------------------------------------------------------------------------
+
+def _sizes(model):
+    layer_bytes = max(module_bytes(layer) for layer in model.model.layers)
+    anchors = module_bytes(model) - sum(module_bytes(l) for l in model.model.layers)
+    return layer_bytes, anchors
+
+
+def _fast_plan(model, budget, cpu_layer_ms, bandwidth_gb_s=10.0, max_context_tokens=0):
+    return plan_residency(
+        model,
+        budget,
+        mode="fast",
+        activation_reserve=0,
+        max_context_tokens=max_context_tokens,
+        bandwidth_gb_s=bandwidth_gb_s,
+        cpu_layer_ms=cpu_layer_ms,
+        gpu_layer_ms=0.01,
+    )
+
+
+def test_fast_plan_computes_on_the_cpu_when_that_beats_the_bus():
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+
+    # A near-zero bus makes every transfer slower than any CPU layer.
+    plan = _fast_plan(model, anchors + 3 * layer_bytes, cpu_layer_ms=1.0, bandwidth_gb_s=1e-6)
+
+    assert plan.cpu_layers and not plan.streamed_layers
+    assert plan.staging_slots == 0, "CPU layers need no staging slots"
+    # Without slots the whole budget goes to resident layers.
+    assert len(plan.resident_layers) == 3
+    assert plan.resident_layers + plan.cpu_layers == list(range(plan.num_layers))
+    assert not plan.is_exact
+    assert plan.vram_weight_bytes <= plan.vram_budget_bytes
+
+
+def test_fast_plan_streams_when_the_bus_beats_the_cpu():
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+
+    plan = _fast_plan(model, anchors + 5 * layer_bytes, cpu_layer_ms=1e6)
+
+    assert plan.streamed_layers and not plan.cpu_layers
+    assert plan.is_exact
+
+
+def test_fast_plan_never_mixes_cpu_and_streamed_layers():
+    """Mixing was measured to be slower than either pure plan (see _plan_fast)."""
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+
+    for cpu_layer_ms in (1e-6, 1e-3, 1.0, 1e6):
+        for extra in range(1, 9):
+            plan = _fast_plan(model, anchors + extra * layer_bytes, cpu_layer_ms=cpu_layer_ms)
+            assert not (plan.cpu_layers and plan.streamed_layers)
+
+
+def test_fast_plan_reserves_kv_cache_only_for_gpu_layers():
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+    full_kv = estimate_kv_cache_bytes(model.config, 64, 4)
+
+    plan = _fast_plan(
+        model, anchors + full_kv + 3 * layer_bytes, cpu_layer_ms=1.0,
+        bandwidth_gb_s=1e-6, max_context_tokens=64,
+    )
+
+    gpu_layers = len(plan.resident_layers)
+    assert plan.cpu_layers
+    assert plan.kv_cache_reserve_bytes == pytest.approx(full_kv * gpu_layers / 8, abs=1)
+
+
+def test_fast_plan_fits_below_the_exact_floor():
+    """With no staging slots, fast mode runs on budgets exact mode must refuse."""
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+    budget = anchors + layer_bytes // 2  # anchors fit, not even one slot does
+
+    with pytest.raises(InsufficientVRAMError):
+        plan_residency(model, budget, activation_reserve=0, max_context_tokens=0, bandwidth_gb_s=10.0)
+
+    plan = _fast_plan(model, budget, cpu_layer_ms=1.0)
+    assert plan.resident_layers == [] and len(plan.cpu_layers) == plan.num_layers
+
+
+def test_plan_rejects_an_unknown_mode():
+    with pytest.raises(ValueError, match="mode"):
+        plan_residency(_TinyLM(), "1GB", bandwidth_gb_s=10.0, mode="fastest")
+
+
+def _cpu_plan(model, resident_count):
+    plan = _plan_for(model, resident_count)
+    plan.cpu_layers, plan.streamed_layers, plan.staging_slots = plan.streamed_layers, [], 0
+    plan.mode = "fast"
+    return plan
+
+
+@pytest.mark.parametrize("resident_count", [0, 3])
+def test_cpu_layers_run_and_restore_on_a_cpu_device(resident_count):
+    torch.manual_seed(4)
+    model = _TinyLM(num_layers=6)
+    model.eval()
+    input_ids = torch.randint(0, model.config.vocab_size, (1, 4))
+    with torch.no_grad():
+        expected = model(input_ids)
+
+    with torch.no_grad():
+        with StreamingModel(model, _cpu_plan(model, resident_count), device=torch.device("cpu")):
+            assert torch.equal(model(input_ids), expected)
+        assert torch.equal(model(input_ids), expected)
+
+
+@needs_cuda
+@pytest.mark.parametrize("resident_count", [0, 2, 5])
+def test_cpu_layers_on_cuda_match_the_gpu_closely(resident_count):
+    """Not bit-identical by design, but the same function: fp32 agrees to rounding."""
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    model = _TinyLM(num_layers=6).to(device)
+    model.eval()
+    input_ids = torch.randint(0, model.config.vocab_size, (1, 5), device=device)
+    with torch.no_grad():
+        expected = model(input_ids)
+
+    plan = _cpu_plan(model, resident_count)
+    with torch.no_grad():
+        with StreamingModel(model, plan, device=device):
+            for layer_idx in plan.cpu_layers:
+                assert next(model.model.layers[layer_idx].parameters()).device.type == "cpu"
+            actual = model(input_ids)
+
+    assert actual.device.type == "cuda", "output must come back to the device"
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+
+
+def test_fast_plan_keeps_exactness_unless_the_cpu_is_clearly_faster():
+    """Identical output is worth something: a marginal CPU win must not buy it away."""
+    from paramap.residency import _CPU_IN_DECODE_FACTOR, _FAST_MIN_SPEEDUP
+
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+    budget = anchors + 3 * layer_bytes  # cpu plan: 3 resident + 5 CPU; stream: 1 + 7
+    bandwidth = 1e-3
+    transfer_ms = layer_bytes / (bandwidth * 1024**3) * 1e3
+    stream_ms = 7 * transfer_ms
+
+    def plan_with_cpu_speedup(speedup):
+        cpu_ms_in_decode = stream_ms / speedup / 5
+        return _fast_plan(
+            model, budget, cpu_layer_ms=cpu_ms_in_decode / _CPU_IN_DECODE_FACTOR,
+            bandwidth_gb_s=bandwidth,
+        )
+
+    assert plan_with_cpu_speedup(_FAST_MIN_SPEEDUP * 0.95).is_exact
+    assert not plan_with_cpu_speedup(_FAST_MIN_SPEEDUP * 1.5).is_exact

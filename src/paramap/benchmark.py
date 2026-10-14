@@ -40,6 +40,8 @@ class RunResult:
     plan: Optional[ResidencyPlan] = None
     identical_to_baseline: Optional[bool] = None
     transfer_bytes: int = 0
+    # Leading generated tokens equal to the baseline's (all of them when identical).
+    matching_tokens: Optional[int] = None
 
     @property
     def vram_peak_gb(self) -> float:
@@ -113,6 +115,7 @@ def benchmark_budgets(
     max_context_tokens: int = 2048,
     staging_slots: int = 2,
     bandwidth_gb_s: Optional[float] = None,
+    mode: str = "exact",
     verbose: bool = True,
 ) -> List[RunResult]:
     """
@@ -121,6 +124,10 @@ def benchmark_budgets(
 
     The baseline goes through exactly the same code path with an unconstrained
     budget, so it is not a separately-written fast path that could diverge.
+
+    In mode="fast" CPU-computed layers round differently from the GPU, so a
+    budget's output may legitimately differ; `matching_tokens` says how far it
+    agreed with the baseline.
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results: List[RunResult] = []
@@ -160,11 +167,13 @@ def benchmark_budgets(
             max_context_tokens=max_context_tokens,
             staging_slots=staging_slots,
             bandwidth_gb_s=bandwidth_gb_s,
+            mode=mode,
         )
         if verbose:
+            cpu_text = f" / {len(plan.cpu_layers)} on CPU" if plan.cpu_layers else ""
             print(
                 f"  plan: {len(plan.resident_layers)} resident / "
-                f"{len(plan.streamed_layers)} streamed, "
+                f"{len(plan.streamed_layers)} streamed{cpu_text}, "
                 f"weights in VRAM {format_bytes(plan.vram_weight_bytes)}"
             )
 
@@ -176,6 +185,10 @@ def benchmark_budgets(
             pinned_layers = streaming.stats()["pinned_layers"]
 
         identical = ids == baseline.generated_ids
+        matching = next(
+            (i for i, (a, b) in enumerate(zip(ids, baseline.generated_ids)) if a != b),
+            min(len(ids), len(baseline.generated_ids)),
+        )
         results.append(
             RunResult(
                 label=str(budget),
@@ -186,10 +199,16 @@ def benchmark_budgets(
                 plan=plan,
                 identical_to_baseline=identical,
                 transfer_bytes=transferred,
+                matching_tokens=matching,
             )
         )
         if verbose:
-            verdict = "identical" if identical else "DIVERGED"
+            if identical:
+                verdict = "identical"
+            elif plan.is_exact:
+                verdict = "DIVERGED"
+            else:
+                verdict = f"same for first {matching}/{len(ids)} tokens (CPU rounding)"
             pinned_text = ""
             if plan.streamed_layers and pinned_layers < len(plan.streamed_layers):
                 pinned_text = (
@@ -207,7 +226,7 @@ def benchmark_budgets(
 def format_results(results: Sequence[RunResult]) -> str:
     baseline = results[0] if results else None
     header = (
-        f"{'Configuration':<24} | {'Layers':>13} | {'Peak VRAM':>11} | "
+        f"{'Configuration':<24} | {'GPU/stream/CPU':>14} | {'Peak VRAM':>11} | "
         f"{'VRAM saved':>11} | {'tokens/s':>9} | {'vs base':>8} | {'Output':>9}"
     )
     lines = [header, "-" * len(header)]
@@ -215,7 +234,9 @@ def format_results(results: Sequence[RunResult]) -> str:
     for result in results:
         plan = result.plan
         layers = (
-            f"{len(plan.resident_layers)}R / {len(plan.streamed_layers)}S" if plan else "-"
+            f"{len(plan.resident_layers)}/{len(plan.streamed_layers)}/{len(plan.cpu_layers)}"
+            if plan
+            else "-"
         )
         if baseline and baseline.vram_peak_bytes and result is not baseline:
             saved = baseline.vram_peak_bytes - result.vram_peak_bytes
@@ -228,11 +249,15 @@ def format_results(results: Sequence[RunResult]) -> str:
             speed_text = "--"
         if result.identical_to_baseline is None:
             output_text = "?"
+        elif result.identical_to_baseline:
+            output_text = "identical"
+        elif plan is not None and not plan.is_exact:
+            output_text = f"{result.matching_tokens}/{len(result.generated_ids)} same"
         else:
-            output_text = "identical" if result.identical_to_baseline else "DIVERGED"
+            output_text = "DIVERGED"
 
         lines.append(
-            f"{result.label:<24} | {layers:>13} | {format_bytes(result.vram_peak_bytes):>11} | "
+            f"{result.label:<24} | {layers:>14} | {format_bytes(result.vram_peak_bytes):>11} | "
             f"{saved_text:>11} | {result.tokens_per_s:>9.1f} | {speed_text:>8} | {output_text:>9}"
         )
 

@@ -19,6 +19,11 @@ must move `bytes_streamed_per_token` across the bus, so
     seconds_per_token >= bytes_streamed_per_token / pcie_bandwidth
 
 and `ResidencyPlan` reports that floor before you run anything.
+
+mode="fast" adds a second way to handle a layer that does not fit: compute it
+on the CPU, straight from RAM. On a machine whose RAM outreads its PCIe link
+that is quicker and needs no VRAM at all, but CPU kernels round differently,
+so the output is no longer bit-identical. The library defaults to "exact".
 """
 
 import math
@@ -147,6 +152,15 @@ class ResidencyPlan:
     `anchor_bytes` covers everything outside the decoder stack -- embeddings,
     the final norm, the output head -- which is touched on every token and so is
     never streamed.
+
+    Each decoder layer is in exactly one of three places:
+      resident -- in VRAM for the whole run
+      streamed -- in host RAM, copied into a GPU staging slot before it runs
+      cpu      -- in host RAM and computed there ("fast" mode only); its
+                  hidden state crosses the bus instead of its weights
+
+    Only "exact" plans (no cpu layers) guarantee output identical to running
+    every layer on the GPU: CPU kernels round differently.
     """
 
     num_layers: int
@@ -160,6 +174,11 @@ class ResidencyPlan:
     streamed_layers: List[int]
     bandwidth_gb_s: float
     dtype_bytes: int = 2
+    cpu_layers: List[int] = field(default_factory=list)
+    mode: str = "exact"
+    # Per-layer, per-token costs the plan was chosen with (0 when unknown).
+    cpu_layer_ms: float = 0.0
+    gpu_layer_ms: float = 0.0
 
     @property
     def total_weight_bytes(self) -> int:
@@ -181,7 +200,7 @@ class ResidencyPlan:
     @property
     def host_weight_bytes(self) -> int:
         """Weight bytes kept in host RAM."""
-        return len(self.streamed_layers) * self.layer_bytes
+        return (len(self.streamed_layers) + len(self.cpu_layers)) * self.layer_bytes
 
     @property
     def vram_saved_bytes(self) -> int:
@@ -214,8 +233,33 @@ class ResidencyPlan:
         return float("inf") if seconds <= 0 else 1.0 / seconds
 
     @property
+    def estimated_seconds_per_token(self) -> float:
+        """
+        Cost-model estimate used to choose between plans; 0 when the per-layer
+        timings are unknown. A streamed layer costs its transfer or its compute,
+        whichever is longer, since the two overlap. `cpu_layer_ms` is already
+        the in-decode estimate. Anchors and the output head are not counted.
+        """
+        if not self.gpu_layer_ms:
+            return 0.0
+        transfer_ms = (
+            self.layer_bytes / (self.bandwidth_gb_s * 1024**3) * 1e3 if self.bandwidth_gb_s > 0 else 0.0
+        )
+        ms = (
+            len(self.resident_layers) * self.gpu_layer_ms
+            + len(self.streamed_layers) * max(transfer_ms, self.gpu_layer_ms)
+            + len(self.cpu_layers) * self.cpu_layer_ms
+        )
+        return ms / 1e3
+
+    @property
+    def is_exact(self) -> bool:
+        """True when the output is guaranteed identical to all-in-VRAM."""
+        return not self.cpu_layers
+
+    @property
     def is_fully_resident(self) -> bool:
-        return not self.streamed_layers
+        return not self.streamed_layers and not self.cpu_layers
 
     def describe(self) -> str:
         lines = [
@@ -227,7 +271,9 @@ class ResidencyPlan:
             f"  resident layers      : {len(self.resident_layers)}/{self.num_layers}"
             f"  ({format_bytes(len(self.resident_layers) * self.layer_bytes)})",
             f"  streamed layers      : {len(self.streamed_layers)}/{self.num_layers}"
-            f"  ({format_bytes(self.host_weight_bytes)} held in host RAM)",
+            f"  ({format_bytes(len(self.streamed_layers) * self.layer_bytes)} held in host RAM)",
+            f"  CPU-computed layers  : {len(self.cpu_layers)}/{self.num_layers}"
+            f"  ({format_bytes(len(self.cpu_layers) * self.layer_bytes)} held in host RAM)",
             f"  anchors (always VRAM): {format_bytes(self.anchor_bytes)}",
             f"  staging slots        : {self.staging_slots}"
             f"  ({format_bytes(self.staging_bytes)})",
@@ -240,7 +286,9 @@ class ResidencyPlan:
         ]
         if self.is_fully_resident:
             lines += ["", "  Nothing needs streaming at this budget: full speed."]
-        else:
+            return "\n".join(lines)
+
+        if self.streamed_layers:
             lines += [
                 "",
                 f"  Streamed per token   : {format_bytes(self.bytes_streamed_per_token)}",
@@ -248,6 +296,19 @@ class ResidencyPlan:
                 f"  Speed ceiling        : {self.tokens_per_s_ceiling:.1f} tokens/s"
                 " (bus alone, best case)",
             ]
+        if self.estimated_seconds_per_token > 0:
+            lines += [
+                "",
+                f"  Estimated speed      : {1.0 / self.estimated_seconds_per_token:.1f} tokens/s"
+                f" (CPU layer {self.cpu_layer_ms:.1f} ms, GPU layer {self.gpu_layer_ms:.1f} ms)",
+            ]
+        lines += [
+            "",
+            "  Output               : identical to all-in-VRAM"
+            if self.is_exact
+            else "  Output               : NOT bit-identical (CPU layers round differently;"
+            " use --exact to guarantee it)",
+        ]
         return "\n".join(lines)
 
 
@@ -264,10 +325,19 @@ def plan_residency(
     bandwidth_gb_s: Optional[float] = None,
     activation_reserve: Any = "auto",
     adapter: Optional[ModelArchAdapter] = None,
+    mode: str = "exact",
+    cpu_layer_ms: Optional[float] = None,
+    gpu_layer_ms: Optional[float] = None,
 ) -> ResidencyPlan:
     """
     Decides how many decoder layers fit in `vram_budget` and how many must be
     streamed from host RAM.
+
+    mode="exact" (the default) only streams, so the output is identical to
+    running everything on the GPU. mode="fast" may also compute layers on the
+    CPU and picks whatever mix the cost model says is quickest; see
+    `_plan_fast`. `cpu_layer_ms` / `gpu_layer_ms` override the per-layer
+    timings it uses (measured / estimated when omitted).
 
     The budget is spent in this order, because each item is non-negotiable
     before the next one is worth anything: anchors (touched every token), the KV
@@ -309,6 +379,29 @@ def plan_residency(
         from .device.profiler import DeviceProfiler
 
         bandwidth_gb_s = DeviceProfiler().benchmark_bandwidth().get("h2d_gb_s", 0.0)
+
+    if mode not in ("exact", "fast"):
+        raise ValueError(f"mode must be 'exact' or 'fast', not {mode!r}")
+
+    if mode == "fast":
+        if cpu_layer_ms is None:
+            cpu_layer_ms = measure_cpu_layer_ms(model, adapter)
+        if gpu_layer_ms is None:
+            gpu_layer_ms = measure_gpu_layer_ms(model, adapter)
+        return _plan_fast(
+            num_layers=num_layers,
+            layer_bytes=layer_bytes,
+            anchor_bytes=anchor_bytes,
+            budget=budget,
+            kv_bytes=kv_bytes,
+            activation_reserve_bytes=activation_reserve_bytes,
+            max_context_tokens=max_context_tokens,
+            staging_slots=staging_slots,
+            bandwidth_gb_s=float(bandwidth_gb_s),
+            dtype_bytes=dtype_bytes,
+            cpu_layer_ms=float(cpu_layer_ms),
+            gpu_layer_ms=float(gpu_layer_ms),
+        )
 
     fixed = anchor_bytes + kv_bytes + activation_reserve_bytes
     if fixed >= budget:
@@ -369,9 +462,201 @@ def plan_residency(
     )
 
 
+def _plan_fast(
+    *,
+    num_layers: int,
+    layer_bytes: int,
+    anchor_bytes: int,
+    budget: int,
+    kv_bytes: int,
+    activation_reserve_bytes: int,
+    max_context_tokens: int,
+    staging_slots: int,
+    bandwidth_gb_s: float,
+    dtype_bytes: int,
+    cpu_layer_ms: float,
+    gpu_layer_ms: float,
+) -> ResidencyPlan:
+    """
+    Chooses between two plans for the layers that do not fit in VRAM and keeps
+    whichever has the lower estimated time per token:
+
+      cpu    -- compute them on the CPU. Needs no VRAM at all (not even a
+                staging slot), and their KV cache lives in host RAM, so the KV
+                reservation only covers the resident layers. RAM bandwidth is
+                the limit.
+      stream -- the exact plan: stream them. Each costs a PCIe transfer or
+                its own GPU compute, whichever is longer (they overlap).
+
+`cpu_layer_ms` is a standalone timing; in real decode a CPU layer also pays
+for hooks, bus crossings and attention over its cache, so it is scaled by
+_CPU_IN_DECODE_FACTOR. And because only the exact plan guarantees identical
+output, the CPU plan must be predicted at least _FAST_MIN_SPEEDUP faster to be
+chosen: on Qwen2.5-0.5B the two measured within 3% of each other while the CPU
+plan's output diverged after 3 tokens, which is all cost and no gain.
+
+    The two are deliberately not mixed. Interleaving streamed layers between
+    CPU layers looked like it should overlap transfers with CPU compute, but
+    both read the same RAM: measured on Qwen2.5-3B (Ryzen 5 5500, RTX 3060),
+    every mixed plan was slower than the pure CPU plan at the same budget
+    (2 GB: 3.3 vs ~4 tokens/s), and a cost model that predicted otherwise
+    cannot be trusted to pick between them.
+    """
+    kv_per_layer = kv_bytes / num_layers if num_layers else 0
+    fixed = anchor_bytes + activation_reserve_bytes
+    if fixed >= budget:
+        raise InsufficientVRAMError(
+            f"A {format_bytes(budget)} budget cannot cover the parts that must stay resident: "
+            f"{format_bytes(anchor_bytes)} of anchors + {format_bytes(activation_reserve_bytes)} "
+            f"of activation reserve = {format_bytes(fixed)}. Raise the budget or pick a smaller "
+            "model."
+        )
+
+    cpu_layer_ms = cpu_layer_ms * _CPU_IN_DECODE_FACTOR
+
+    # cpu: every GPU layer is resident and carries its own KV cache.
+    resident = min(num_layers, int((budget - fixed) // (layer_bytes + kv_per_layer)))
+    cpu_ms = resident * gpu_layer_ms + (num_layers - resident) * cpu_layer_ms
+    best = (resident, 0, 0)
+
+    # stream: every layer runs on the GPU, so the whole KV cache is reserved.
+    if resident < num_layers and bandwidth_gb_s > 0:
+        transfer_ms = layer_bytes / (bandwidth_gb_s * 1024**3) * 1e3
+        for slots in sorted({max(1, int(staging_slots)), 1}, reverse=True):
+            room = budget - fixed - kv_bytes - slots * layer_bytes
+            if room < 0:
+                continue
+            stream_resident = min(num_layers - 1, int(room // layer_bytes))
+            streamed = num_layers - stream_resident
+            stream_ms = stream_resident * gpu_layer_ms + streamed * max(transfer_ms, gpu_layer_ms)
+            if cpu_ms * _FAST_MIN_SPEEDUP > stream_ms:
+                best = (stream_resident, streamed, slots)
+            break
+
+    resident, streamed, slots = best
+    offloaded = list(range(resident, num_layers))
+    streamed_layers = offloaded if streamed else []
+    cpu_layers = [] if streamed else offloaded
+
+    return ResidencyPlan(
+        num_layers=num_layers,
+        layer_bytes=layer_bytes,
+        anchor_bytes=anchor_bytes,
+        vram_budget_bytes=budget,
+        kv_cache_reserve_bytes=int(kv_per_layer * (resident + len(streamed_layers))),
+        activation_reserve_bytes=activation_reserve_bytes,
+        staging_slots=slots,
+        resident_layers=list(range(resident)),
+        streamed_layers=streamed_layers,
+        bandwidth_gb_s=bandwidth_gb_s,
+        dtype_bytes=dtype_bytes,
+        cpu_layers=cpu_layers,
+        mode="fast",
+        cpu_layer_ms=cpu_layer_ms,
+        gpu_layer_ms=gpu_layer_ms,
+    )
+
+
+# A CPU layer's cost in real decode over its standalone timing: hooks, the
+# hidden state crossing the bus, attention over the cache. Measured 1.39x on
+# Qwen2.5-3B and 1.6x on Qwen2.5-0.5B (RTX 3060, Ryzen 5 5500).
+_CPU_IN_DECODE_FACTOR = 1.5
+
+# The CPU plan gives up bit-identical output, so it has to be clearly faster.
+_FAST_MIN_SPEEDUP = 1.15
+
+# Fallbacks when a layer cannot be timed: decode is bound by memory bandwidth,
+# ~26 GB/s effective from dual-channel DDR4-3200, ~100 GB/s on an RTX 3060
+# with kernel-launch overhead included.
+_CPU_DECODE_GB_S = 25.0
+_GPU_DECODE_GB_S = 100.0
+
+
+def measure_cpu_layer_ms(model: nn.Module, adapter: Optional[ModelArchAdapter] = None) -> float:
+    """
+    Times one decoder layer processing one token on the CPU. Falls back to a
+    RAM-bandwidth estimate if the layer cannot be called standalone.
+    """
+    return _time_layer(model, adapter, torch.device("cpu"), _CPU_DECODE_GB_S)
+
+
+def measure_gpu_layer_ms(model: nn.Module, adapter: Optional[ModelArchAdapter] = None) -> float:
+    """
+    Times one decoder layer processing one token on the GPU, using a temporary
+    copy of a single layer. Worth the brief VRAM: for small layers kernel-launch
+    overhead, not bandwidth, sets the time, and no byte count predicts that
+    (0.3 ms estimated vs ~1.6 ms real on Qwen2.5-0.5B).
+    """
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    return _time_layer(model, adapter, device, _GPU_DECODE_GB_S)
+
+
+@torch.no_grad()
+def _time_layer(
+    model: nn.Module,
+    adapter: Optional[ModelArchAdapter],
+    device: torch.device,
+    fallback_gb_s: float,
+    repeats: int = 8,
+) -> float:
+    adapter = adapter or QwenArchitectureAdapter()
+    layer = adapter.get_layers(model)[0]
+    fallback = module_bytes(layer) / (fallback_gb_s * 1024**3) * 1e3
+    use_cuda = device.type == "cuda"
+
+    copied = False
+    try:
+        param = next(layer.parameters())
+        if param.device != device:
+            import copy
+
+            layer = copy.deepcopy(layer).to(device)
+            copied = True
+        config = getattr(model, "config", None)
+        hidden = torch.randn(1, 1, config.hidden_size, dtype=param.dtype, device=device)
+        position_ids = torch.zeros(1, 1, dtype=torch.long, device=device)
+        kwargs: Dict[str, Any] = {"position_ids": position_ids}
+        rotary = getattr(getattr(model, "model", None), "rotary_emb", None)
+        if rotary is not None:
+            rotary_device = next(rotary.buffers()).device
+            cos, sin = rotary(hidden.to(rotary_device), position_ids.to(rotary_device))
+            kwargs["position_embeddings"] = (cos.to(device, param.dtype), sin.to(device, param.dtype))
+
+        for _ in range(3):
+            layer(hidden, **kwargs)
+        if use_cuda:
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        for _ in range(repeats):
+            layer(hidden, **kwargs)
+        if use_cuda:
+            torch.cuda.synchronize(device)
+        return (time.perf_counter() - start) / repeats * 1e3
+    except Exception:
+        return fallback
+    finally:
+        if copied:
+            del layer
+            if use_cuda:
+                torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # The runtime
 # ---------------------------------------------------------------------------
+
+def _to_device(value: Any, device: torch.device) -> Any:
+    """Moves every tensor inside (nested) args/kwargs; leaves other objects alone."""
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_to_device(v, device) for v in value)
+    if isinstance(value, list):
+        return [_to_device(v, device) for v in value]
+    if isinstance(value, dict):
+        return {k: _to_device(v, device) for k, v in value.items()}
+    return value
+
 
 class StreamingModel:
     """
@@ -383,6 +668,9 @@ class StreamingModel:
     GPU staging slot immediately before that layer runs, and the transfer of the
     next layer is issued on a side stream so it overlaps the current layer's
     compute.
+
+    Layers in `plan.cpu_layers` stay in host RAM and are computed there; hooks
+    move their inputs to the CPU and their output back to the device.
 
     Use as a context manager; `__exit__` puts every parameter back where it was.
     """
@@ -446,6 +734,7 @@ class StreamingModel:
             return self
 
         streamed = set(self.plan.streamed_layers)
+        on_cpu = set(self.plan.cpu_layers)
 
         # Anchors and resident layers go to the device. Buffers of streamed
         # layers go too: they are tiny and streaming them would buy nothing.
@@ -453,12 +742,16 @@ class StreamingModel:
         for idx, layer in enumerate(self._layers):
             if idx in streamed:
                 self._move_layer_to_host(idx, layer)
+            elif idx in on_cpu:
+                layer.to("cpu")
             else:
                 layer.to(self.device)
 
         if streamed:
             self._allocate_slots()
             self._install_hooks()
+        if on_cpu:
+            self._install_cpu_hooks(on_cpu)
 
         self._installed = True
         return self
@@ -630,6 +923,29 @@ class StreamingModel:
             self._handles.append(
                 layer.register_forward_hook(self._make_layer_post_hook(layer_idx))
             )
+
+    def _install_cpu_hooks(self, on_cpu: set) -> None:
+        # A CPU layer receives its inputs (hidden state, rotary embeddings,
+        # masks) on the CPU; its output goes back to the device only when the
+        # next layer is not also on the CPU, so a run of CPU layers crosses the
+        # bus twice per token, not twice per layer. Its KV cache entries are
+        # created on the CPU and stay there.
+        cpu = torch.device("cpu")
+        last = len(self._layers) - 1
+        for layer_idx in sorted(on_cpu):
+            layer = self._layers[layer_idx]
+            self._handles.append(
+                layer.register_forward_pre_hook(
+                    lambda module, args, kwargs: (_to_device(args, cpu), _to_device(kwargs, cpu)),
+                    with_kwargs=True,
+                )
+            )
+            if layer_idx == last or (layer_idx + 1) not in on_cpu:
+                self._handles.append(
+                    layer.register_forward_hook(
+                        lambda module, args, output: _to_device(output, self.device)
+                    )
+                )
 
     def _on_pass_start(self, module, args) -> None:
         self._next_to_prefetch = 0

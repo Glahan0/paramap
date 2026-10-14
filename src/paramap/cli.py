@@ -3,8 +3,9 @@ Command line interface for ParamMap.
 
 Three things you can ask it:
 
-  paramap plan  -- what would a given VRAM budget cost me? (loads no weights
-                   onto the GPU, so it is safe to ask before committing)
+  paramap plan  -- what would a given VRAM budget cost me? (loads the model
+                   into RAM, and at most one layer briefly onto the GPU to time
+                   it, so it is safe to ask before committing)
   paramap run   -- generate under a budget, with telemetry
   paramap bench -- sweep several budgets and report the VRAM/speed trade-off,
                    checking at each step that the output has not changed
@@ -26,6 +27,10 @@ from .residency import (
 )
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+def _mode(args: argparse.Namespace) -> str:
+    return "exact" if args.exact else "fast"
 
 
 def _pick_device(requested: Optional[str]) -> torch.device:
@@ -78,6 +83,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         staging_slots=args.staging_slots,
         bandwidth_gb_s=args.bandwidth,
         activation_reserve=args.activation_reserve,
+        mode=_mode(args),
     )
     print()
     print(plan.describe())
@@ -96,6 +102,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         staging_slots=args.staging_slots,
         bandwidth_gb_s=args.bandwidth,
         activation_reserve=args.activation_reserve,
+        mode=_mode(args),
     )
     print()
     print(plan.describe())
@@ -143,6 +150,8 @@ def _generate_and_report(model, tokenizer, prompt, device, args, streaming) -> N
             f" | {len(streaming.plan.streamed_layers)}/{streaming.plan.num_layers}"
             f" layers streamed ({format_bytes(streaming.plan.bytes_streamed_per_token)}/token)"
         )
+    if streaming.plan.cpu_layers:
+        line += f" | {len(streaming.plan.cpu_layers)}/{streaming.plan.num_layers} layers on CPU"
     print(line)
 
 
@@ -164,17 +173,32 @@ def cmd_bench(args: argparse.Namespace) -> int:
         max_context_tokens=args.context,
         staging_slots=args.staging_slots,
         bandwidth_gb_s=args.bandwidth,
+        mode=_mode(args),
     )
 
     print()
     print(format_results(results))
 
-    diverged = [r.label for r in results if r.identical_to_baseline is False]
     print()
-    if diverged:
-        print(f"WARNING: output changed at these budgets: {', '.join(diverged)}")
-        print("Residency is supposed to be lossless; please report this.")
+    # Only exact plans promise identical output; a CPU-computed layer that
+    # flips a near-tie token is expected, not a bug.
+    broken = [
+        r.label
+        for r in results
+        if r.identical_to_baseline is False and (r.plan is None or r.plan.is_exact)
+    ]
+    differed = [r.label for r in results if r.identical_to_baseline is False and r not in broken]
+    if broken:
+        print(f"WARNING: output changed at these exact budgets: {', '.join(broken)}")
+        print("Exact mode is supposed to be lossless; please report this.")
         return 1
+    if differed:
+        print(
+            f"Output differed from the all-in-VRAM baseline at: {', '.join(differed)}. "
+            "These plans compute layers on the CPU, which rounds differently; "
+            "use --exact for identical output."
+        )
+        return 0
     print("Output was identical to the all-in-VRAM baseline at every budget.")
     return 0
 
@@ -226,6 +250,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sub.add_argument("--device", default=None, help="e.g. cuda, cuda:1, cpu")
         sub.add_argument("--dtype", default=None, help="e.g. bfloat16, float16, float32")
+        sub.add_argument(
+            "--exact",
+            action="store_true",
+            help=(
+                "Guarantee output identical to running everything on the GPU: only "
+                "stream layers, never compute them on the CPU (slower)"
+            ),
+        )
 
     plan_parser = subparsers.add_parser(
         "plan", help="Show what a VRAM budget would cost, without generating"

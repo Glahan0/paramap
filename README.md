@@ -1,24 +1,30 @@
 # ParamMap
 
-**Run local LLMs under a VRAM budget you choose, without changing what they say.**
+**Run local LLMs under a VRAM budget you choose.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Bilingual: EN/TR](https://img.shields.io/badge/docs-EN%20%7C%20TR-orange.svg)](README.tr.md)
 
 Tell ParamMap how much VRAM it may use. It keeps as many decoder layers in GPU
-memory as that allows, holds the rest in host RAM, and streams each one in just
-before it runs — overlapping the transfer with computation on a side CUDA
-stream. Every parameter is kept, the arithmetic is unchanged, and the generated
-tokens are **identical** to running the model entirely on the GPU.
+memory as that allows and holds the rest in host RAM. Every parameter is kept;
+nothing is pruned. The layers that did not fit run one of two ways:
 
-What you trade is generation speed, and the trade is predictable: per token the
-runtime moves `streamed_bytes` across the bus, so
+- **fast** (the CLI default): they are **computed on the CPU**, straight from
+  RAM. This needs no VRAM at all and is usually quicker, but CPU kernels round
+  differently from the GPU, so greedy output can occasionally flip a near-tie
+  token.
+- **exact** (`--exact`): they are **streamed** to the GPU just before they run,
+  overlapping the transfer with compute on a side CUDA stream. The arithmetic
+  is unchanged and the generated tokens are **identical** to running the model
+  entirely on the GPU.
+
+`paramap plan` picks the faster of the two for your machine, tells you which
+it picked, and estimates the speed before you commit to anything. In exact mode
+the bus sets a hard ceiling:
 
 ```
 tokens/s <= pcie_bandwidth / streamed_bytes_per_token
 ```
-
-`paramap plan` reports that ceiling before you commit to anything.
 
 ---
 
@@ -42,14 +48,17 @@ pip install -e .
 ```
 
 ```bash
-# What would a 3 GB budget cost? (nothing is loaded onto the GPU to answer this)
+# What would a 3 GB budget cost? (at most one layer touches the GPU, briefly, to time it)
 paramap plan --model Qwen/Qwen2.5-1.5B-Instruct --vram 3GB
 
 # Generate under that budget
 paramap run --model Qwen/Qwen2.5-1.5B-Instruct --vram 3GB -i
 
-# Sweep budgets and verify the output never changes
+# Sweep budgets: VRAM, speed, and how far the output matches the all-GPU run
 paramap bench --model Qwen/Qwen2.5-1.5B-Instruct --budgets 3GB,2GB,1.5GB
+
+# Any of the above with a guarantee that the output is identical
+paramap run --model Qwen/Qwen2.5-1.5B-Instruct --vram 3GB --exact
 ```
 
 As a library:
@@ -63,6 +72,7 @@ name = "Qwen/Qwen2.5-0.5B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(name)
 model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).eval()
 
+# mode="exact" (the library default) streams; mode="fast" may use the CPU.
 plan = plan_residency(model, "500MB", max_context_tokens=2048)
 print(plan.describe())
 
@@ -122,6 +132,42 @@ and a 3B layer is 154 MB against a 0.5B layer's 18 MB. Streaming dense bf16
 weights over PCIe is a good trade when only a few layers have to move, and an
 expensive one when most of the model does.
 
+### Fast mode on Qwen2.5-3B
+
+Same model and GPU; Ryzen 5 5500 (6 cores, AVX2) with dual-channel DDR4-3200,
+which reads at 35 GB/s, against 13.4 GB/s over PCIe. A 3B layer takes 5.9 ms on
+the CPU and 11.5 ms to cross the bus, so the planner chose the CPU every time:
+
+| Budget | GPU / CPU layers | Peak VRAM | VRAM saved | tokens/s | exact mode | Output vs all-GPU |
+|---|---|---|---|---|---|---|
+| baseline | 36 / 0 | 5.87 GB | — | 18.7 | 18.6 | — |
+| 5 GB | 29 / 7 | 4.84 GB | 17.5% | **9.8** | 7.8 | identical |
+| 4 GB | 22 / 14 | 3.82 GB | 35.0% | **7.0** | 5.1 | identical |
+| 3 GB | 15 / 21 | 2.79 GB | 52.4% | **5.3** | 3.7 | identical |
+| 2 GB | 8 / 28 | 1.76 GB | 69.9% | **4.3** | 2.9 | identical |
+| 1.5 GB | 5 / 31 | 1.33 GB | 77.4% | **4.0** | 2.6 | first 23/48 tokens |
+| 1.15 GB | 3 / 33 | 1.03 GB | 82.4% | **3.8** | 2.3 | first 23/48 tokens |
+| 0.8 GB | 0 / 36 | 607 MB | 89.9% | **3.5** | won't fit | first 20/48 tokens |
+
+Fast mode is 26–65% quicker at every budget and goes lower, since CPU layers
+need no staging slots and keep their KV cache in RAM. Where the output
+differed, it was a near-tie: at the first differing token the all-GPU model's
+top two candidates were 0.125 logits apart, and both continuations read
+equally well. That is not a measured quality loss, but it is not identical
+either; use `--exact` when that matters.
+
+The planner does not mix the two. Streaming some layers while the CPU computes
+others looked like it should overlap, but both read the same RAM, and every
+mixed plan measured slower than the pure CPU plan at the same budget.
+
+The planner only gives up identical output when it predicts the CPU is at
+least 15% faster. On Qwen2.5-0.5B the two measured within 3% of each other
+while the CPU plan's output diverged after 3 tokens, so fast mode picks
+streaming there, and on a machine with slow RAM and a fast bus it will do the
+same. To decide, it times one layer on the CPU and one on the GPU; its
+estimates landed within 1% of the measured speed (3B at 5 GB: 9.8 estimated,
+9.9 measured; 0.5B at 600 MB: 19.6 vs 19.7).
+
 Two honest caveats:
 
 - **The floor is set by what cannot be streamed.** Embeddings and the output
@@ -144,6 +190,9 @@ In this order, because each item is worthless without the one before it:
 4. **Staging slots** — the GPU buffers streamed layers rotate through. Two is
    enough to overlap a transfer with the previous layer's compute.
 5. **Resident layers** — as many as the remainder holds.
+
+In fast mode, when the CPU wins, step 4 is skipped and step 2 only covers the
+resident layers: CPU layers keep their KV cache in host RAM.
 
 If step 1–3 already exceed the budget, ParamMap refuses with an explanation
 rather than failing later with an out-of-memory error.

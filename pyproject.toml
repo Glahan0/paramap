@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "paramap"
 version = "0.2.0"
-description = "Budgeted, lossless VRAM/RAM residency for local LLMs"
+description = "Run local LLMs under a VRAM budget: exact layer streaming or faster CPU offload"
 authors = [{ name = "ParamMap Team" }]
 readme = "README.md"
 license = { text = "MIT" }
