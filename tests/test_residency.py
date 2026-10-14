@@ -367,9 +367,9 @@ def test_fast_plan_computes_on_the_cpu_when_that_beats_the_bus():
     plan = _fast_plan(model, anchors + 3 * layer_bytes, cpu_layer_ms=1.0, bandwidth_gb_s=1e-6)
 
     assert plan.cpu_layers and not plan.streamed_layers
-    assert plan.staging_slots == 0, "CPU layers need no staging slots"
-    # Without slots the whole budget goes to resident layers.
-    assert len(plan.resident_layers) == 3
+    # One slot is kept for prompts; the rest of the budget is resident layers.
+    assert plan.staging_slots == 1
+    assert len(plan.resident_layers) == 2
     assert plan.resident_layers + plan.cpu_layers == list(range(plan.num_layers))
     assert not plan.is_exact
     assert plan.vram_weight_bytes <= plan.vram_budget_bytes
@@ -422,6 +422,9 @@ def test_fast_plan_fits_below_the_exact_floor():
 
     plan = _fast_plan(model, budget, cpu_layer_ms=1.0)
     assert plan.resident_layers == [] and len(plan.cpu_layers) == plan.num_layers
+    # No room for the prompt slot either: prompts fall back to the CPU.
+    assert plan.staging_slots == 0
+    assert plan.vram_weight_bytes <= budget
 
 
 def test_plan_rejects_an_unknown_mode():
@@ -429,9 +432,10 @@ def test_plan_rejects_an_unknown_mode():
         plan_residency(_TinyLM(), "1GB", bandwidth_gb_s=10.0, mode="fastest")
 
 
-def _cpu_plan(model, resident_count):
+def _cpu_plan(model, resident_count, prompt_slot=False):
     plan = _plan_for(model, resident_count)
-    plan.cpu_layers, plan.streamed_layers, plan.staging_slots = plan.streamed_layers, [], 0
+    plan.cpu_layers, plan.streamed_layers = plan.streamed_layers, []
+    plan.staging_slots = 1 if prompt_slot else 0
     plan.mode = "fast"
     return plan
 
@@ -480,13 +484,13 @@ def test_fast_plan_keeps_exactness_unless_the_cpu_is_clearly_faster():
 
     model = _TinyLM(num_layers=8)
     layer_bytes, anchors = _sizes(model)
-    budget = anchors + 3 * layer_bytes  # cpu plan: 3 resident + 5 CPU; stream: 1 + 7
+    budget = anchors + 3 * layer_bytes  # cpu: 2 resident + 6 CPU + prompt slot; stream: 1 + 7
     bandwidth = 1e-3
     transfer_ms = layer_bytes / (bandwidth * 1024**3) * 1e3
     stream_ms = 7 * transfer_ms
 
     def plan_with_cpu_speedup(speedup):
-        cpu_ms_in_decode = stream_ms / speedup / 5
+        cpu_ms_in_decode = stream_ms / speedup / 6
         return _fast_plan(
             model, budget, cpu_layer_ms=cpu_ms_in_decode / _CPU_IN_DECODE_FACTOR,
             bandwidth_gb_s=bandwidth,
@@ -494,3 +498,67 @@ def test_fast_plan_keeps_exactness_unless_the_cpu_is_clearly_faster():
 
     assert plan_with_cpu_speedup(_FAST_MIN_SPEEDUP * 0.95).is_exact
     assert not plan_with_cpu_speedup(_FAST_MIN_SPEEDUP * 1.5).is_exact
+
+
+def test_fast_plan_counts_the_prompt_slot_against_the_budget():
+    model = _TinyLM(num_layers=8)
+    layer_bytes, anchors = _sizes(model)
+
+    for extra in range(1, 8):
+        plan = _fast_plan(model, anchors + extra * layer_bytes, cpu_layer_ms=1.0, bandwidth_gb_s=1e-6)
+        assert plan.cpu_layers
+        assert plan.staging_bytes == plan.staging_slots * layer_bytes
+        assert plan.vram_weight_bytes <= plan.vram_budget_bytes
+
+
+# ---------------------------------------------------------------------------
+# Prompts through the slot, decode on the CPU, on a real (tiny) Qwen2
+# ---------------------------------------------------------------------------
+
+def _tiny_qwen2(device):
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(6)
+    config = Qwen2Config(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=6,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128,
+    )
+    return Qwen2ForCausalLM(config).to(device).eval()
+
+
+@torch.no_grad()
+def _prompt_then_decode(model, prompt, steps, device):
+    from transformers import DynamicCache
+
+    cache = DynamicCache()
+    logits = [model(prompt.to(device), past_key_values=cache, use_cache=True).logits[0, -1]]
+    token = logits[-1].argmax().view(1, 1)
+    for _ in range(steps):
+        logits.append(model(token.to(device), past_key_values=cache, use_cache=True).logits[0, -1])
+        token = logits[-1].argmax().view(1, 1)
+    return torch.stack(logits), cache
+
+
+@needs_cuda
+@pytest.mark.parametrize("prompt_slot", [True, False])
+def test_cpu_layers_handle_prompt_then_decode(prompt_slot):
+    """With the slot, prompts run CPU layers on the GPU and hand the KV cache to the CPU."""
+    device = torch.device("cuda")
+    model = _tiny_qwen2(device)
+    prompt = torch.randint(0, 64, (1, 12))
+    expected, _ = _prompt_then_decode(model, prompt, steps=6, device=device)
+
+    plan = _cpu_plan(model, resident_count=2, prompt_slot=prompt_slot)
+    with StreamingModel(model, plan, device=device) as streaming:
+        actual, cache = _prompt_then_decode(model, prompt, steps=6, device=device)
+        stats = streaming.stats()
+        for layer_idx in plan.cpu_layers:
+            assert next(model.model.layers[layer_idx].parameters()).device.type == "cpu"
+            assert cache.layers[layer_idx].keys.device.type == "cpu"
+        for layer_idx in plan.resident_layers:
+            assert cache.layers[layer_idx].keys.device.type == "cuda"
+
+    # One prompt pass: each CPU layer borrows the slot once, decode never does.
+    assert stats["prefill_layer_runs"] == (len(plan.cpu_layers) if prompt_slot else 0)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+

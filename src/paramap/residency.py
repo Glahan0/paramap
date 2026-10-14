@@ -186,7 +186,11 @@ class ResidencyPlan:
 
     @property
     def staging_bytes(self) -> int:
-        return self.staging_slots * self.layer_bytes if self.streamed_layers else 0
+        # Streamed layers rotate through the slots every token; CPU layers use
+        # one to run multi-token passes (prompts) on the GPU.
+        if not (self.streamed_layers or self.cpu_layers):
+            return 0
+        return self.staging_slots * self.layer_bytes
 
     @property
     def resident_weight_bytes(self) -> int:
@@ -301,6 +305,13 @@ class ResidencyPlan:
                 "",
                 f"  Estimated speed      : {1.0 / self.estimated_seconds_per_token:.1f} tokens/s"
                 f" (CPU layer {self.cpu_layer_ms:.1f} ms, GPU layer {self.gpu_layer_ms:.1f} ms)",
+            ]
+        if self.cpu_layers:
+            lines += [
+                "  Prompt processing    : CPU layers run on the GPU through a staging slot"
+                if self.staging_slots
+                else "  Prompt processing    : on the CPU (no room for a staging slot; long"
+                " prompts will be slow)",
             ]
         lines += [
             "",
@@ -514,10 +525,20 @@ plan's output diverged after 3 tokens, which is all cost and no gain.
 
     cpu_layer_ms = cpu_layer_ms * _CPU_IN_DECODE_FACTOR
 
-    # cpu: every GPU layer is resident and carries its own KV cache.
-    resident = min(num_layers, int((budget - fixed) // (layer_bytes + kv_per_layer)))
+    # cpu: every GPU layer is resident and carries its own KV cache. One
+    # staging slot is kept back for prompts: a multi-token pass costs a CPU
+    # layer ~3 ms per token (bf16 GEMM without native CPU support), so a
+    # 512-token prompt would take ~40 s on Qwen2.5-3B, while streaming the
+    # layer through the slot costs ~12 ms whatever the length.
+    def cpu_resident(slot_bytes: int) -> int:
+        room = budget - fixed - slot_bytes
+        return max(0, min(num_layers, int(room // (layer_bytes + kv_per_layer)))) if room >= 0 else -1
+
+    resident, prefill_slots = cpu_resident(0), 0
+    if resident < num_layers and cpu_resident(layer_bytes) >= 0:
+        resident, prefill_slots = cpu_resident(layer_bytes), 1
     cpu_ms = resident * gpu_layer_ms + (num_layers - resident) * cpu_layer_ms
-    best = (resident, 0, 0)
+    best = (resident, 0, prefill_slots)
 
     # stream: every layer runs on the GPU, so the whole KV cache is reserved.
     if resident < num_layers and bandwidth_gb_s > 0:
@@ -645,6 +666,28 @@ def _time_layer(
 # The runtime
 # ---------------------------------------------------------------------------
 
+def _move_layer_cache(cache: Any, layer_idx: int, device: torch.device) -> None:
+    """Moves one layer's KV cache entries to `device` (no-op without a cache)."""
+    if cache is None:
+        return
+    layers = getattr(cache, "layers", None)
+    if layers is not None:
+        if layer_idx < len(layers):
+            entry = layers[layer_idx]
+            for attr in ("keys", "values"):
+                tensor = getattr(entry, attr, None)
+                if torch.is_tensor(tensor):
+                    setattr(entry, attr, tensor.to(device))
+            if hasattr(entry, "device"):
+                entry.device = device
+        return
+    # transformers < 4.56 kept parallel lists.
+    for attr in ("key_cache", "value_cache"):
+        tensors = getattr(cache, attr, None)
+        if tensors is not None and layer_idx < len(tensors) and torch.is_tensor(tensors[layer_idx]):
+            tensors[layer_idx] = tensors[layer_idx].to(device)
+
+
 def _to_device(value: Any, device: torch.device) -> Any:
     """Moves every tensor inside (nested) args/kwargs; leaves other objects alone."""
     if torch.is_tensor(value):
@@ -693,6 +736,13 @@ class StreamingModel:
         self.pin_reserve_bytes = parse_bytes(pin_reserve)
         # Flat host buffers page-locked with cudaHostRegister; unregistered on remove().
         self._registered: List[torch.Tensor] = []
+
+        # CPU layers: host tensors by layer, the GPU slot prompts run them in,
+        # and which layers are borrowing that slot right now.
+        self._cpu_host: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._prefill_slot: Optional[Dict[str, torch.Tensor]] = None
+        self._on_gpu_now: set = set()
+        self.prefill_layer_runs = 0
 
         self._layers = self.adapter.get_layers(model)
         self._installed = False
@@ -771,6 +821,15 @@ class StreamingModel:
             for name, param in params.items():
                 if name in host:
                     param.data = host[name]
+
+        # A pass interrupted mid-prompt can leave a CPU layer bound to the slot.
+        for layer_idx, host in self._cpu_host.items():
+            for name, param in self._layers[layer_idx].named_parameters():
+                if name in host:
+                    param.data = host[name]
+        self._cpu_host.clear()
+        self._on_gpu_now.clear()
+        self._prefill_slot = None
 
         # Outside a plan the host copies are ordinary RAM again: page-locked
         # memory is a system-wide cost, held only while streaming needs it.
@@ -925,27 +984,79 @@ class StreamingModel:
             )
 
     def _install_cpu_hooks(self, on_cpu: set) -> None:
-        # A CPU layer receives its inputs (hidden state, rotary embeddings,
-        # masks) on the CPU; its output goes back to the device only when the
-        # next layer is not also on the CPU, so a run of CPU layers crosses the
-        # bus twice per token, not twice per layer. Its KV cache entries are
-        # created on the CPU and stay there.
-        cpu = torch.device("cpu")
+        # Decode (one token per pass): a CPU layer receives its inputs on the
+        # CPU and its output goes back to the device only at the end of a run
+        # of CPU layers, so the bus is crossed twice per run, not per layer.
+        # Its KV cache lives on the CPU.
+        #
+        # Prompts (several tokens per pass): CPU bf16 matmuls cost ~3 ms per
+        # token per layer here, so if the plan kept a staging slot the layer's
+        # weights are copied into it and the layer runs on the GPU. Its KV
+        # cache entries are moved to the CPU afterwards, where decode expects
+        # them.
+        for layer_idx in sorted(on_cpu):
+            self._cpu_host[layer_idx] = {
+                name: param.data for name, param in self._layers[layer_idx].named_parameters()
+            }
+
+        if self.is_cuda and self.plan.staging_slots:
+            template = self._cpu_host[min(on_cpu)]
+            self._prefill_slot = {
+                name: torch.empty_like(tensor, device=self.device) for name, tensor in template.items()
+            }
+
         last = len(self._layers) - 1
         for layer_idx in sorted(on_cpu):
             layer = self._layers[layer_idx]
+            group_end = layer_idx == last or (layer_idx + 1) not in on_cpu
             self._handles.append(
-                layer.register_forward_pre_hook(
-                    lambda module, args, kwargs: (_to_device(args, cpu), _to_device(kwargs, cpu)),
-                    with_kwargs=True,
+                layer.register_forward_pre_hook(self._make_cpu_pre_hook(layer_idx), with_kwargs=True)
+            )
+            self._handles.append(
+                layer.register_forward_hook(
+                    self._make_cpu_post_hook(layer_idx, group_end), with_kwargs=True
                 )
             )
-            if layer_idx == last or (layer_idx + 1) not in on_cpu:
-                self._handles.append(
-                    layer.register_forward_hook(
-                        lambda module, args, output: _to_device(output, self.device)
-                    )
-                )
+
+    def _make_cpu_pre_hook(self, layer_idx: int):
+        cpu = torch.device("cpu")
+        params = dict(self._layers[layer_idx].named_parameters())
+
+        def hook(module, args, kwargs):
+            hidden = args[0] if args else kwargs.get("hidden_states")
+            is_prompt = torch.is_tensor(hidden) and hidden.dim() == 3 and hidden.shape[1] > 1
+            if is_prompt and self._prefill_slot is not None:
+                slot = self._prefill_slot
+                host = self._cpu_host[layer_idx]
+                # Same stream as the compute, so this waits for the previous
+                # user of the slot to finish before overwriting it.
+                for name, param in params.items():
+                    slot[name].copy_(host[name])
+                    param.data = slot[name]
+                self._on_gpu_now.add(layer_idx)
+                self.prefill_layer_runs += 1
+                self.transfer_bytes_total += self.plan.layer_bytes
+                return _to_device(args, self.device), _to_device(kwargs, self.device)
+            return _to_device(args, cpu), _to_device(kwargs, cpu)
+
+        return hook
+
+    def _make_cpu_post_hook(self, layer_idx: int, group_end: bool):
+        cpu = torch.device("cpu")
+        params = dict(self._layers[layer_idx].named_parameters())
+
+        def hook(module, args, kwargs, output):
+            if layer_idx in self._on_gpu_now:
+                self._on_gpu_now.discard(layer_idx)
+                host = self._cpu_host[layer_idx]
+                for name, param in params.items():
+                    param.data = host[name]
+                cache_idx = getattr(getattr(module, "self_attn", None), "layer_idx", layer_idx)
+                _move_layer_cache(kwargs.get("past_key_values"), cache_idx, cpu)
+                return output
+            return _to_device(output, self.device) if group_end else output
+
+        return hook
 
     def _on_pass_start(self, module, args) -> None:
         self._next_to_prefetch = 0
@@ -1042,6 +1153,8 @@ class StreamingModel:
             ),
             "staging_slots": self.plan.staging_slots,
             "forward_passes": self.tokens_observed,
+            # CPU-layer executions moved to the GPU because the pass was a prompt.
+            "prefill_layer_runs": self.prefill_layer_runs,
             "bytes_transferred": self.transfer_bytes_total,
             "vram_weight_bytes": self.plan.vram_weight_bytes,
             "host_weight_bytes": self.plan.host_weight_bytes,
