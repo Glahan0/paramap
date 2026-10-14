@@ -181,6 +181,21 @@ class ResidencyPlan:
     # Per-layer, per-token costs the plan was chosen with (0 when unknown).
     cpu_layer_ms: float = 0.0
     gpu_layer_ms: float = 0.0
+    # Host RAM the off-GPU layers may occupy: what was available when the plan
+    # was made, less a reserve for the rest of the system (0 = unknown).
+    host_ram_room_bytes: int = 0
+
+    @property
+    def host_overflow_bytes(self) -> int:
+        """
+        Off-GPU weight bytes that do not fit in free RAM. Every one of them is
+        read on every token, so they are either read from disk again each
+        time or held by squeezing other programs out of RAM -- in either case
+        slower, and on Qwen2.5-7B at 4 GB free RAM fell to 0.43 GB.
+        """
+        if not self.host_ram_room_bytes:
+            return 0
+        return max(0, self.host_weight_bytes - self.host_ram_room_bytes)
 
     @property
     def total_weight_bytes(self) -> int:
@@ -205,7 +220,7 @@ class ResidencyPlan:
 
     @property
     def host_weight_bytes(self) -> int:
-        """Weight bytes kept in host RAM."""
+        """Weight bytes kept off the GPU (in RAM, or for a mapped model on disk)."""
         return (len(self.streamed_layers) + len(self.cpu_layers)) * self.layer_bytes
 
     @property
@@ -277,9 +292,9 @@ class ResidencyPlan:
             f"  resident layers      : {len(self.resident_layers)}/{self.num_layers}"
             f"  ({format_bytes(len(self.resident_layers) * self.layer_bytes)})",
             f"  streamed layers      : {len(self.streamed_layers)}/{self.num_layers}"
-            f"  ({format_bytes(len(self.streamed_layers) * self.layer_bytes)} held in host RAM)",
+            f"  ({format_bytes(len(self.streamed_layers) * self.layer_bytes)} off the GPU)",
             f"  CPU-computed layers  : {len(self.cpu_layers)}/{self.num_layers}"
-            f"  ({format_bytes(len(self.cpu_layers) * self.layer_bytes)} held in host RAM)",
+            f"  ({format_bytes(len(self.cpu_layers) * self.layer_bytes)} off the GPU)",
             f"  anchors (always VRAM): {format_bytes(self.anchor_bytes)}",
             f"  staging slots        : {self.staging_slots}"
             f"  ({format_bytes(self.staging_bytes)})",
@@ -315,6 +330,8 @@ class ResidencyPlan:
                 else "  Prompt processing    : on the CPU (no room for a staging slot; long"
                 " prompts will be slow)",
             ]
+        if self.host_overflow_bytes:
+            lines += ["", *self.ram_warning().splitlines()]
         lines += [
             "",
             "  Output               : identical to all-in-VRAM"
@@ -324,12 +341,54 @@ class ResidencyPlan:
         ]
         return "\n".join(lines)
 
+    def ram_warning(self) -> str:
+        """Empty when the off-GPU layers fit in free RAM."""
+        if not self.host_overflow_bytes:
+            return ""
+        return (
+            f"  WARNING: RAM too small. {format_bytes(self.host_weight_bytes)} of layers live off the GPU,\n"
+            f"           but only {format_bytes(self.host_ram_room_bytes)} of RAM is free for them. The other\n"
+            f"           {format_bytes(self.host_overflow_bytes)} is re-read from disk every token, or other\n"
+            "           programs are pushed out of RAM to hold it: expect less than the\n"
+            "           estimated speed and a system low on memory. Raise the budget or\n"
+            "           close programs."
+        )
+
 
 class InsufficientVRAMError(RuntimeError):
     """Raised when a budget cannot even hold the always-resident parts."""
 
 
-def plan_residency(
+# RAM left to the rest of the system when judging whether off-GPU layers fit;
+# the same default StreamingModel keeps free when pinning.
+_HOST_RAM_RESERVE = 2 * 1024**3
+
+
+def plan_residency(model: nn.Module, vram_budget: Any, *, host_ram_available: Any = None, **kwargs) -> ResidencyPlan:
+    """
+    See `_choose_plan` for how the budget is spent. Also records how much RAM
+    the off-GPU layers have room for (`host_ram_available`, measured when
+    omitted, less a 2 GB reserve) so the plan can say when they will not fit.
+
+    Only for a model mapped from its files: an ordinarily loaded model already
+    holds every weight in RAM, so free RAM says nothing about whether they fit.
+    """
+    plan = _choose_plan(model, vram_budget, **kwargs)
+    if not is_file_backed(model):
+        return plan
+    if host_ram_available is None:
+        try:
+            import psutil
+
+            host_ram_available = psutil.virtual_memory().available
+        except ImportError:
+            host_ram_available = 0
+    available = parse_bytes(host_ram_available)
+    plan.host_ram_room_bytes = max(1, available - _HOST_RAM_RESERVE) if available else 0
+    return plan
+
+
+def _choose_plan(
     model: nn.Module,
     vram_budget: Any,
     *,

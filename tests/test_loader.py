@@ -123,3 +123,45 @@ def test_streaming_from_the_file_is_identical_and_restores_the_views(tmp_path, p
     for name, param in model.named_parameters():
         assert param.device.type == "cpu"
         assert param.data_ptr() == views[name], f"{name} was left on a copy"
+
+
+def _budget_for(model, resident_count):
+    layers = model.model.layers
+    layer_bytes = max(module_bytes(layer) for layer in layers)
+    anchor_bytes = module_bytes(model) - sum(module_bytes(layer) for layer in layers)
+    return anchor_bytes + (resident_count + 2) * layer_bytes, layer_bytes
+
+
+def test_plan_warns_when_off_gpu_layers_exceed_free_ram(tmp_path):
+    from paramap.residency import _HOST_RAM_RESERVE, plan_residency
+
+    _save_tiny_qwen2(tmp_path)
+    model, _ = load_model_mmap(str(tmp_path), torch.float32)
+    budget, layer_bytes = _budget_for(model, resident_count=2)
+
+    def plan_with_free(free_bytes):
+        return plan_residency(
+            model, budget, host_ram_available=free_bytes, activation_reserve=0,
+            max_context_tokens=0, bandwidth_gb_s=10.0,
+        )
+
+    roomy = plan_with_free(_HOST_RAM_RESERVE + 100 * layer_bytes)
+    assert roomy.host_overflow_bytes == 0 and roomy.ram_warning() == ""
+    assert "RAM too small" not in roomy.describe()
+
+    tight = plan_with_free(_HOST_RAM_RESERVE + layer_bytes)
+    assert tight.host_overflow_bytes == tight.host_weight_bytes - layer_bytes
+    assert "RAM too small" in tight.describe()
+
+
+def test_no_ram_warning_for_a_model_already_in_ram(tmp_path):
+    """Its weights are already resident, so free RAM says nothing."""
+    from paramap.residency import plan_residency
+
+    model = _save_tiny_qwen2(tmp_path)
+    budget, _ = _budget_for(model, resident_count=2)
+    plan = plan_residency(
+        model, budget, host_ram_available=1, activation_reserve=0,
+        max_context_tokens=0, bandwidth_gb_s=10.0,
+    )
+    assert plan.host_overflow_bytes == 0

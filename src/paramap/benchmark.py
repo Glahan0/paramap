@@ -194,6 +194,8 @@ def benchmark_budgets(
                 f"{len(plan.streamed_layers)} streamed{cpu_text}, "
                 f"weights in VRAM {format_bytes(plan.vram_weight_bytes)}"
             )
+            if plan.ram_warning():
+                print(plan.ram_warning())
 
         with StreamingModel(model, plan, device=device, pin_reserve=pin_reserve) as streaming:
             ids, text, tps, peak = run_generation(
