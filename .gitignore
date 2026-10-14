@@ -1,0 +1,34 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Run logs
+*.log
+
+# Data & Maps (large artifacts)
+data/
+maps/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
