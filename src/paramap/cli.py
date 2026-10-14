@@ -18,6 +18,7 @@ from typing import List, Optional
 import torch
 
 from .benchmark import DEFAULT_PROMPT, benchmark_budgets, format_results, run_generation
+from .loader import load_model_mmap
 from .residency import (
     InsufficientVRAMError,
     StreamingModel,
@@ -47,12 +48,18 @@ def _load(model_name: str, device: torch.device, dtype: Optional[str]):
     else:
         torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    print(f"Loading {model_name} ({torch_dtype}) into host RAM...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
     # Deliberately loaded on the CPU: the residency plan decides what reaches
-    # the GPU, so a model larger than VRAM never has to fit there first.
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype)
-    model.eval()
+    # the GPU, so a model larger than VRAM never has to fit there first. And
+    # mapped rather than read, so it does not have to fit in RAM either.
+    try:
+        model, directory = load_model_mmap(model_name, torch_dtype)
+        print(f"Mapped {model_name} ({torch_dtype}) from disk; weights are read on demand.")
+    except FileNotFoundError:
+        print(f"Loading {model_name} ({torch_dtype}) into host RAM (no safetensors to map)...")
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype)
+        model.eval()
+        directory = model_name
+    tokenizer = AutoTokenizer.from_pretrained(directory)
     return model, tokenizer
 
 

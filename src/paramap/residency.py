@@ -37,6 +37,7 @@ import torch.nn as nn
 
 from .arch.base import ModelArchAdapter
 from .arch.qwen import QwenArchitectureAdapter
+from .loader import is_file_backed, release_file_pages
 
 _BYTE_UNITS = {
     "b": 1,
@@ -766,6 +767,12 @@ class StreamingModel:
         self.transfer_bytes_total = 0
         self.tokens_observed = 0
 
+        # For a model loaded by `load_model_mmap`, every parameter's original
+        # tensor is a view into the checkpoint file: holding on to it costs no
+        # RAM, and restoring it on exit means the next plan starts from the
+        # file again rather than from copies a previous plan left behind.
+        self._originals: List[Tuple[nn.Parameter, torch.Tensor]] = []
+
     # -- lifecycle ---------------------------------------------------------
 
     def __enter__(self) -> "StreamingModel":
@@ -786,16 +793,29 @@ class StreamingModel:
         streamed = set(self.plan.streamed_layers)
         on_cpu = set(self.plan.cpu_layers)
 
+        if is_file_backed(self.model):
+            self._originals = [(param, param.data) for param in self.model.parameters()]
+
         # Anchors and resident layers go to the device. Buffers of streamed
         # layers go too: they are tiny and streaming them would buy nothing.
+        # A file-backed model's pages are released as soon as their bytes have
+        # been copied out (to VRAM or into pinned RAM), so that pinning the
+        # next layer sees how much RAM is really available.
+        layer_param_ids = {id(p) for layer in self._layers for p in layer.parameters()}
+        anchor_sources = [p.data for p in self.model.parameters() if id(p) not in layer_param_ids]
         self._move_anchors_to_device()
+        release_file_pages(self.model, anchor_sources)
         for idx, layer in enumerate(self._layers):
+            sources = [p.data for p in layer.parameters()]
             if idx in streamed:
                 self._move_layer_to_host(idx, layer)
+                if any(t.is_pinned() for t in self._host_params[idx].values()):
+                    release_file_pages(self.model, sources)
             elif idx in on_cpu:
                 layer.to("cpu")
             else:
                 layer.to(self.device)
+                release_file_pages(self.model, sources)
 
         if streamed:
             self._allocate_slots()
@@ -830,6 +850,10 @@ class StreamingModel:
         self._cpu_host.clear()
         self._on_gpu_now.clear()
         self._prefill_slot = None
+
+        for param, original in self._originals:
+            param.data = original
+        self._originals.clear()
 
         # Outside a plan the host copies are ordinary RAM again: page-locked
         # memory is a system-wide cost, held only while streaming needs it.
