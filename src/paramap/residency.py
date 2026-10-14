@@ -27,6 +27,7 @@ so the output is no longer bit-identical. The library defaults to "exact".
 """
 
 import math
+import mmap
 import re
 import time
 from dataclasses import dataclass, field
@@ -689,6 +690,29 @@ def _move_layer_cache(cache: Any, layer_idx: int, device: torch.device) -> None:
             tensors[layer_idx] = tensors[layer_idx].to(device)
 
 
+def _clear_cuda_error() -> None:
+    """
+    Consumes the CUDA runtime's pending error. torch's cudart bindings do not
+    expose cudaGetLastError, so it is called from the runtime library torch
+    itself loaded.
+    """
+    import ctypes
+    import glob
+    import os
+
+    lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+    names = glob.glob(os.path.join(lib_dir, "cudart64_*.dll")) + glob.glob(
+        os.path.join(lib_dir, "libcudart.so*")
+    )
+    names += ["libcudart.so.12", "libcudart.so"]
+    for name in names:
+        try:
+            ctypes.CDLL(name).cudaGetLastError()
+            return
+        except (OSError, AttributeError):
+            continue
+
+
 def _to_device(value: Any, device: torch.device) -> Any:
     """Moves every tensor inside (nested) args/kwargs; leaves other objects alone."""
     if torch.is_tensor(value):
@@ -737,6 +761,7 @@ class StreamingModel:
         self.pin_reserve_bytes = parse_bytes(pin_reserve)
         # Flat host buffers page-locked with cudaHostRegister; unregistered on remove().
         self._registered: List[torch.Tensor] = []
+        self._pin_failed = False
 
         # CPU layers: host tensors by layer, the GPU slot prompts run them in,
         # and which layers are borrowing that slot right now.
@@ -941,10 +966,15 @@ class StreamingModel:
             nbytes = param.data.numel() * param.data.element_size()
             total += -(-nbytes // alignment) * alignment
 
-        if total == 0 or not self._can_pin(total):
+        if total == 0 or self._pin_failed or not self._can_pin(total):
             return {}
 
-        flat = torch.empty(total, dtype=torch.uint8)
+        # An anonymous mapping rather than torch.empty: torch's CPU allocator
+        # keeps freed blocks for reuse (measured on Windows: 2.6 GB freed, none
+        # returned), so after a plan is removed its pinned layers would still
+        # count as used and the next plan could pin almost nothing. A mapping
+        # is returned to the OS as soon as its last view is dropped.
+        flat = torch.frombuffer(mmap.mmap(-1, total), dtype=torch.uint8)
         host: Dict[str, torch.Tensor] = {}
         for name, param in refs.items():
             src = param.data
@@ -955,6 +985,12 @@ class StreamingModel:
 
         err = torch.cuda.cudart().cudaHostRegister(flat.data_ptr(), total, 0)
         if err != torch.cuda.cudart().cudaError.success:
+            # The driver can refuse before RAM runs out (measured: at 7.0 GB
+            # here). The failure stays pending in the CUDA runtime and the next
+            # unrelated call -- allocating a staging slot -- would raise it as
+            # "out of memory", so clear it, and stop trying for this plan.
+            _clear_cuda_error()
+            self._pin_failed = True
             # The copy is still a valid pageable host buffer; use it as such.
             return host
 

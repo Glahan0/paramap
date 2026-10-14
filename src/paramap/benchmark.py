@@ -116,6 +116,7 @@ def benchmark_budgets(
     staging_slots: int = 2,
     bandwidth_gb_s: Optional[float] = None,
     mode: str = "exact",
+    pin_reserve: Any = "2GB",
     verbose: bool = True,
 ) -> List[RunResult]:
     """
@@ -132,8 +133,6 @@ def benchmark_budgets(
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results: List[RunResult] = []
 
-    if verbose:
-        print("Baseline: every weight in VRAM")
     baseline_plan = plan_residency(
         model,
         "1024GB",
@@ -141,22 +140,41 @@ def benchmark_budgets(
         staging_slots=staging_slots,
         bandwidth_gb_s=bandwidth_gb_s or 0.0,
     )
-    with StreamingModel(model, baseline_plan, device=device):
-        ids, text, tps, peak = run_generation(
-            model, tokenizer, prompt, device, max_new_tokens=max_new_tokens
-        )
-    baseline = RunResult(
-        label="baseline (all in VRAM)",
-        tokens_per_s=tps,
-        vram_peak_bytes=peak,
-        generated_ids=ids,
-        text=text,
-        plan=baseline_plan,
-        identical_to_baseline=True,
+    baseline: Optional[RunResult] = None
+    needed = (
+        baseline_plan.vram_weight_bytes
+        + baseline_plan.kv_cache_reserve_bytes
+        + baseline_plan.activation_reserve_bytes
     )
-    results.append(baseline)
-    if verbose:
-        print(f"  {tps:6.1f} tok/s | peak VRAM {format_bytes(peak)}")
+    free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else None
+    if free is not None and needed > free:
+        # A model larger than VRAM has no all-in-VRAM run to compare with.
+        # Streaming runs the same kernels on the same bytes at every budget,
+        # so exact budgets must still agree with each other.
+        if verbose:
+            print(
+                f"Baseline skipped: the whole model needs {format_bytes(needed)} of VRAM, "
+                f"{format_bytes(free)} is free. Output is compared with the first budget instead."
+            )
+    else:
+        if verbose:
+            print("Baseline: every weight in VRAM")
+        with StreamingModel(model, baseline_plan, device=device):
+            ids, text, tps, peak = run_generation(
+                model, tokenizer, prompt, device, max_new_tokens=max_new_tokens
+            )
+        baseline = RunResult(
+            label="baseline (all in VRAM)",
+            tokens_per_s=tps,
+            vram_peak_bytes=peak,
+            generated_ids=ids,
+            text=text,
+            plan=baseline_plan,
+            identical_to_baseline=True,
+        )
+        results.append(baseline)
+        if verbose:
+            print(f"  {tps:6.1f} tok/s | peak VRAM {format_bytes(peak)}")
 
     for budget in budgets:
         if verbose:
@@ -177,31 +195,33 @@ def benchmark_budgets(
                 f"weights in VRAM {format_bytes(plan.vram_weight_bytes)}"
             )
 
-        with StreamingModel(model, plan, device=device) as streaming:
+        with StreamingModel(model, plan, device=device, pin_reserve=pin_reserve) as streaming:
             ids, text, tps, peak = run_generation(
                 model, tokenizer, prompt, device, max_new_tokens=max_new_tokens
             )
             transferred = streaming.transfer_bytes_total
             pinned_layers = streaming.stats()["pinned_layers"]
 
-        identical = ids == baseline.generated_ids
+        reference = baseline.generated_ids if baseline else ids
+        identical = ids == reference
         matching = next(
-            (i for i, (a, b) in enumerate(zip(ids, baseline.generated_ids)) if a != b),
-            min(len(ids), len(baseline.generated_ids)),
+            (i for i, (a, b) in enumerate(zip(ids, reference)) if a != b),
+            min(len(ids), len(reference)),
         )
-        results.append(
-            RunResult(
-                label=str(budget),
-                tokens_per_s=tps,
-                vram_peak_bytes=peak,
-                generated_ids=ids,
-                text=text,
-                plan=plan,
-                identical_to_baseline=identical,
-                transfer_bytes=transferred,
-                matching_tokens=matching,
-            )
+        result = RunResult(
+            label=str(budget) if baseline else f"{budget} (reference)",
+            tokens_per_s=tps,
+            vram_peak_bytes=peak,
+            generated_ids=ids,
+            text=text,
+            plan=plan,
+            identical_to_baseline=identical,
+            transfer_bytes=transferred,
+            matching_tokens=matching,
         )
+        results.append(result)
+        if baseline is None:
+            baseline = result
         if verbose:
             if identical:
                 verdict = "identical"
