@@ -130,7 +130,7 @@ src/paramap/
 ├── residency.py      # budget planner + streaming runtime  <- the core
 ├── benchmark.py      # VRAM / tokens-per-second / output-identity measurement
 ├── cli.py            # paramap plan | run | bench
-├── arch/             # per-architecture layer access (Qwen, Llama, Mistral...)
+├── arch/             # per-architecture layer access (Qwen and Llama-style layouts)
 ├── device/           # hardware probe and real PCIe bandwidth measurement
 ├── i18n/             # EN/TR message catalogue
 └── legacy/           # archived earlier approach, see below
@@ -141,7 +141,8 @@ legacy/               # archived plans and experiments
 ```
 
 Supported models: any causal LM whose decoder layers are a `ModuleList` under
-`model.model.layers` — Qwen, Llama, Mistral, Gemma and relatives. Other
+`model.model.layers`. Measured on Qwen2.5 only; Llama, Mistral and Gemma use
+the same layout and are expected to work, but are not yet tested. Other
 architectures need a `ModelArchAdapter` subclass; see `arch/base.py`.
 
 ---
@@ -168,7 +169,7 @@ path. `legacy/experiments/05_evaluation.py` reproduces the measurements.
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,legacy]"   # legacy: gguf, for the archived code
 pytest -q
 ```
 
