@@ -878,6 +878,10 @@ class StreamingModel:
 
         for param, original in self._originals:
             param.data = original
+        # Pages read during the run (layers streamed from the file, CPU
+        # layers) would otherwise keep counting as used, and the next plan
+        # would pin less each time (7B: 16, 13, 9, 5 layers across budgets).
+        release_file_pages(self.model, [original for _, original in self._originals])
         self._originals.clear()
 
         # Outside a plan the host copies are ordinary RAM again: page-locked
