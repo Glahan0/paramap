@@ -140,21 +140,49 @@ the CPU and 11.5 ms to cross the bus, so the planner chose the CPU every time:
 
 | Budget | GPU / CPU layers | Peak VRAM | VRAM saved | tokens/s | exact mode | Output vs all-GPU |
 |---|---|---|---|---|---|---|
-| baseline | 36 / 0 | 5.87 GB | — | 18.7 | 18.6 | — |
-| 5 GB | 29 / 7 | 4.84 GB | 17.5% | **9.8** | 7.8 | identical |
-| 4 GB | 22 / 14 | 3.82 GB | 35.0% | **7.0** | 5.1 | identical |
-| 3 GB | 15 / 21 | 2.79 GB | 52.4% | **5.3** | 3.7 | identical |
-| 2 GB | 8 / 28 | 1.76 GB | 69.9% | **4.3** | 2.9 | identical |
-| 1.5 GB | 5 / 31 | 1.33 GB | 77.4% | **4.0** | 2.6 | first 23/48 tokens |
-| 1.15 GB | 3 / 33 | 1.03 GB | 82.4% | **3.8** | 2.3 | first 23/48 tokens |
-| 0.8 GB | 0 / 36 | 607 MB | 89.9% | **3.5** | won't fit | first 20/48 tokens |
+| baseline | 36 / 0 | 5.87 GB | — | 18.4 | 18.6 | — |
+| 5 GB | 28 / 8 | 4.84 GB | 17.5% | **10.5** | 7.8 | first 23/48 tokens |
+| 4 GB | 21 / 15 | 3.82 GB | 35.0% | **7.7** | 5.1 | identical |
+| 3 GB | 14 / 22 | 2.79 GB | 52.4% | **6.1** | 3.7 | first 23/48 tokens |
+| 2 GB | 7 / 29 | 1.76 GB | 69.9% | **5.0** | 2.9 | identical |
+| 1.5 GB | 4 / 32 | 1.33 GB | 77.4% | **4.6** | 2.6 | identical |
+| 1.15 GB | 2 / 34 | 1.03 GB | 82.4% | **4.4** | 2.3 | first 23/48 tokens |
+| 0.8 GB | 0 / 36 | 607 MB | 89.9% | **3.4** | won't fit | first 20/48 tokens |
 
-Fast mode is 26–65% quicker at every budget and goes lower, since CPU layers
-need no staging slots and keep their KV cache in RAM. Where the output
-differed, it was a near-tie: at the first differing token the all-GPU model's
-top two candidates were 0.125 logits apart, and both continuations read
-equally well. That is not a measured quality loss, but it is not identical
-either; use `--exact` when that matters.
+Fast mode is 35–91% quicker at every budget and goes lower, since CPU layers
+keep their KV cache in RAM and need at most one staging slot. Where greedy
+output differed, it was at a near-tie: at the first differing token the
+all-GPU model's top two candidates were 0.125 logits apart.
+
+**Prompts.** Without native bf16 support a CPU layer costs ~3 ms per prompt
+token, so fast plans keep one staging slot and run CPU layers on the GPU for
+multi-token passes, handing their KV cache back to the CPU afterwards. At 2 GB:
+
+| Prompt | first token, fast | fast without the slot | exact |
+|---|---|---|---|
+| 25 tokens | 0.54 s | 2.43 s | 0.36 s |
+| 512 tokens | 0.68 s | 43.1 s | 0.40 s |
+| 2000 tokens | 1.21 s | 185.6 s | 0.74 s |
+
+At budgets too small for the slot (0.8 GB here) prompts fall back to the CPU,
+and `paramap plan` says so.
+
+**Quality.** WikiText-2 test, 16,384 tokens teacher-forced in 512-token chunks
+(prompt path) and 2,048 tokens fed one at a time through the KV cache (decode
+path), each compared with the all-GPU run. For scale, the first row stays
+entirely on the GPU and only swaps the attention kernel (sdpa → eager):
+
+| Configuration | prompt PPL | prompt KL (nats/token) | decode PPL | decode KL | decode top-1 agreement |
+|---|---|---|---|---|---|
+| all-GPU baseline | 10.256 | — | 14.941 | — | — |
+| GPU, eager attention (reference) | +0.142% | 1.75e-3 | +0.161% | 2.28e-3 | 97.45% |
+| fast 2 GB (29 layers on CPU) | **identical** | 0 | +0.139% | 1.44e-3 | 97.89% |
+| fast 0.8 GB (all 36 on CPU) | +0.036% | 1.08e-3 | −0.028% | 1.44e-3 | 97.79% |
+
+Fast mode moves the output less than swapping one GPU attention kernel for
+another does, and perplexity moves within ±0.15% in both directions: rounding,
+not a quality loss. It is still not identical; use `--exact` when that
+matters.
 
 The planner does not mix the two. Streaming some layers while the CPU computes
 others looked like it should overlap, but both read the same RAM, and every
@@ -191,8 +219,9 @@ In this order, because each item is worthless without the one before it:
    enough to overlap a transfer with the previous layer's compute.
 5. **Resident layers** — as many as the remainder holds.
 
-In fast mode, when the CPU wins, step 4 is skipped and step 2 only covers the
-resident layers: CPU layers keep their KV cache in host RAM.
+In fast mode, when the CPU wins, step 4 reserves a single slot (used only to
+run prompts on the GPU) and step 2 only covers the resident layers: CPU layers
+keep their KV cache in host RAM.
 
 If step 1–3 already exceed the budget, ParamMap refuses with an explanation
 rather than failing later with an out-of-memory error.
