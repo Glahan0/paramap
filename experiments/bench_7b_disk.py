@@ -59,6 +59,8 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(directory)
 
     for mode, budgets in (("exact", args.exact_budgets), ("fast", args.fast_budgets)):
+        if not budgets:
+            continue
         say()
         say(f"=== {mode} === ({ram_line()})")
         captured = io.StringIO()

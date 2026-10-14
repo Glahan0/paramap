@@ -1,0 +1,30 @@
+Qwen/Qwen2.5-7B-Instruct | NVIDIA GeForce RTX 3060 | 2026-10-14 20:00
+RAM: 10.62 GB available of 15.79 GB
+Mapped in 8.4 s
+
+=== exact === (RAM: 10.34 GB available of 15.79 GB)
+Baseline skipped: the whole model needs 14.58 GB of VRAM, 7.01 GB is free. Output is compared with the first budget instead.
+
+Budget: 7GB
+  plan: 8 resident / 20 streamed, weights in VRAM 6.37 GB
+     1.3 tok/s | peak VRAM 6.40 GB | output identical | only 16/20 streamed layers pinned (host RAM low), so slower than the bus allows
+
+Budget: 6GB
+  plan: 6 resident / 22 streamed, weights in VRAM 5.50 GB
+     1.2 tok/s | peak VRAM 5.53 GB | output identical | only 16/22 streamed layers pinned (host RAM low), so slower than the bus allows
+
+Budget: 5GB
+  plan: 3 resident / 25 streamed, weights in VRAM 4.20 GB
+     1.0 tok/s | peak VRAM 4.22 GB | output identical | only 16/25 streamed layers pinned (host RAM low), so slower than the bus allows
+
+Budget: 4GB
+  plan: 1 resident / 27 streamed, weights in VRAM 3.33 GB
+     0.9 tok/s | peak VRAM 3.35 GB | output identical | only 16/27 streamed layers pinned (host RAM low), so slower than the bus allows
+
+Configuration            | GPU/stream/CPU |   Peak VRAM |  VRAM saved |  tokens/s |  vs base |    Output
+--------------------------------------------------------------------------------------------------------
+7GB (reference)          |         8/20/0 |     6.40 GB |          -- |       1.3 |       -- | identical
+6GB                      |         6/22/0 |     5.53 GB |       13.6% |       1.2 |   -10.8% | identical
+5GB                      |         3/25/0 |     4.22 GB |       34.0% |       1.0 |   -25.4% | identical
+4GB                      |         1/27/0 |     3.35 GB |       47.6% |       0.9 |   -33.4% | identical
+RAM: 12.09 GB available of 15.79 GB
