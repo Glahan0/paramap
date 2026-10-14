@@ -623,3 +623,31 @@ def test_cpu_embedding_output_is_identical(resident_count):
         actual, _ = _prompt_then_decode(model, prompt, steps=5, device=device)
 
     assert torch.equal(actual, expected)
+
+
+@needs_cuda
+def test_cpu_embedding_works_with_generate():
+    """`generate` places its tensors on `model.device`, read from the embedding."""
+    device = torch.device("cuda")
+    model = _qwen2(False, device)
+    prompt = torch.randint(0, 256, (1, 10), device=device)
+
+    def generate():
+        return model.generate(
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            max_new_tokens=5,
+            min_new_tokens=5,
+            do_sample=False,
+        )
+
+    expected = generate()
+    model_class = type(model)
+    plan = _plan_for(model, 1)
+    plan.cpu_anchor_bytes = module_bytes(model.model.embed_tokens)
+    with StreamingModel(model, plan, device=device):
+        assert model.device.type == "cuda"
+        actual = generate()
+
+    assert torch.equal(actual, expected)
+    assert type(model) is model_class

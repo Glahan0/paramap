@@ -883,6 +883,8 @@ class StreamingModel:
         self._layers = self.adapter.get_layers(model)
         self._installed = False
         self._handles: List[Any] = []
+        # The model's class while a CPU embedding has it report the device.
+        self._model_class: Optional[type] = None
 
         # Host-side master copies of streamed parameters, by layer then name.
         self._host_params: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -975,6 +977,9 @@ class StreamingModel:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        if self._model_class is not None:
+            self.model.__class__ = self._model_class
+            self._model_class = None
 
         # Rebind every streamed parameter to its host copy so the model is a
         # plain CPU/GPU model again rather than pointing into freed slots.
@@ -1174,6 +1179,17 @@ class StreamingModel:
                 lambda module, args, output: _to_device(output, self.device)
             )
         )
+        # transformers reads `model.device` from the first parameter, which is
+        # usually this table; `generate` would then build position ids on the
+        # CPU. While the plan is installed the model reports the GPU instead.
+        if isinstance(getattr(type(self.model), "device", None), property):
+            self._model_class = type(self.model)
+            device = self.device
+            self.model.__class__ = type(
+                self._model_class.__name__,
+                (self._model_class,),
+                {"device": property(lambda model: device)},
+            )
 
     def _install_cpu_hooks(self, on_cpu: set) -> None:
         # Decode (one token per pass): a CPU layer receives its inputs on the
