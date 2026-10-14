@@ -562,3 +562,64 @@ def test_cpu_layers_handle_prompt_then_decode(prompt_slot):
     assert stats["prefill_layer_runs"] == (len(plan.cpu_layers) if prompt_slot else 0)
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
+
+
+# ---------------------------------------------------------------------------
+# The input embedding stays on the CPU
+# ---------------------------------------------------------------------------
+
+def _qwen2(tie_word_embeddings, device):
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(7)
+    config = Qwen2Config(
+        vocab_size=256, hidden_size=32, intermediate_size=64, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128,
+        tie_word_embeddings=tie_word_embeddings,
+    )
+    return Qwen2ForCausalLM(config).to(device).eval()
+
+
+def test_untied_embedding_is_planned_on_the_cpu():
+    from paramap.residency import untied_embedding_bytes
+
+    untied = _qwen2(False, "cpu")
+    embed_bytes = module_bytes(untied.model.embed_tokens)
+    assert untied_embedding_bytes(untied) == embed_bytes
+
+    plan = plan_residency(untied, "1GB", bandwidth_gb_s=10.0, activation_reserve=0)
+    assert plan.cpu_anchor_bytes == embed_bytes
+    # Off the VRAM bill, still part of the model.
+    assert plan.total_weight_bytes == module_bytes(untied)
+    assert plan.vram_weight_bytes == module_bytes(untied) - embed_bytes
+
+    off = plan_residency(untied, "1GB", bandwidth_gb_s=10.0, embedding_on_cpu=False)
+    assert off.cpu_anchor_bytes == 0
+
+
+def test_tied_embedding_stays_with_the_output_head():
+    tied = _qwen2(True, "cpu")
+    assert tied.lm_head.weight is tied.model.embed_tokens.weight
+    plan = plan_residency(tied, "1GB", bandwidth_gb_s=10.0)
+    assert plan.cpu_anchor_bytes == 0
+
+
+@needs_cuda
+@pytest.mark.parametrize("resident_count", [4, 1])
+def test_cpu_embedding_output_is_identical(resident_count):
+    """A lookup is a copy: moving it to the CPU must not change a single bit."""
+    device = torch.device("cuda")
+    model = _qwen2(False, device)
+    prompt = torch.randint(0, 256, (1, 10))
+    expected, _ = _prompt_then_decode(model, prompt, steps=5, device=device)
+
+    plan = _plan_for(model, resident_count)
+    if resident_count == len(model.model.layers):
+        plan.streamed_layers, plan.staging_slots = [], 0
+    plan.cpu_anchor_bytes = module_bytes(model.model.embed_tokens)
+    with StreamingModel(model, plan, device=device):
+        assert model.model.embed_tokens.weight.device.type == "cpu"
+        assert model.lm_head.weight.device.type == "cuda"
+        actual, _ = _prompt_then_decode(model, prompt, steps=5, device=device)
+
+    assert torch.equal(actual, expected)

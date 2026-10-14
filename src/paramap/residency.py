@@ -153,7 +153,9 @@ class ResidencyPlan:
 
     `anchor_bytes` covers everything outside the decoder stack -- embeddings,
     the final norm, the output head -- which is touched on every token and so is
-    never streamed.
+    never streamed. It lives in VRAM, except the input embedding when it is not
+    shared with the output head (`cpu_anchor_bytes`): a lookup reads only the
+    rows of the tokens at hand, so it stays on the CPU (see `plan_residency`).
 
     Each decoder layer is in exactly one of three places:
       resident -- in VRAM for the whole run
@@ -184,6 +186,8 @@ class ResidencyPlan:
     # Host RAM the off-GPU layers may occupy: what was available when the plan
     # was made, less a reserve for the rest of the system (0 = unknown).
     host_ram_room_bytes: int = 0
+    # Anchors kept on the CPU (the input embedding table); not in anchor_bytes.
+    cpu_anchor_bytes: int = 0
 
     @property
     def host_overflow_bytes(self) -> int:
@@ -199,7 +203,7 @@ class ResidencyPlan:
 
     @property
     def total_weight_bytes(self) -> int:
-        return self.anchor_bytes + self.num_layers * self.layer_bytes
+        return self.anchor_bytes + self.cpu_anchor_bytes + self.num_layers * self.layer_bytes
 
     @property
     def staging_bytes(self) -> int:
@@ -287,7 +291,7 @@ class ResidencyPlan:
             f"VRAM budget            : {format_bytes(self.vram_budget_bytes)}",
             f"Model weights (total)  : {format_bytes(self.total_weight_bytes)}"
             f"  ({self.num_layers} layers x {format_bytes(self.layer_bytes)}"
-            f" + {format_bytes(self.anchor_bytes)} anchors)",
+            f" + {format_bytes(self.anchor_bytes + self.cpu_anchor_bytes)} anchors)",
             "",
             f"  resident layers      : {len(self.resident_layers)}/{self.num_layers}"
             f"  ({format_bytes(len(self.resident_layers) * self.layer_bytes)})",
@@ -295,7 +299,12 @@ class ResidencyPlan:
             f"  ({format_bytes(len(self.streamed_layers) * self.layer_bytes)} off the GPU)",
             f"  CPU-computed layers  : {len(self.cpu_layers)}/{self.num_layers}"
             f"  ({format_bytes(len(self.cpu_layers) * self.layer_bytes)} off the GPU)",
-            f"  anchors (always VRAM): {format_bytes(self.anchor_bytes)}",
+            f"  anchors (always VRAM): {format_bytes(self.anchor_bytes)}"
+            + (
+                f"  (+ {format_bytes(self.cpu_anchor_bytes)} input embedding on the CPU)"
+                if self.cpu_anchor_bytes
+                else ""
+            ),
             f"  staging slots        : {self.staging_slots}"
             f"  ({format_bytes(self.staging_bytes)})",
             "",
@@ -355,6 +364,30 @@ class ResidencyPlan:
         )
 
 
+def untied_embedding_bytes(model: nn.Module) -> int:
+    """Size of the input embedding table if it is not the output head's weight."""
+    embedding = _untied_embedding(model)
+    return module_bytes(embedding, include_buffers=False) if embedding is not None else 0
+
+
+def _untied_embedding(model: nn.Module) -> Optional[nn.Module]:
+    get_in = getattr(model, "get_input_embeddings", None)
+    get_out = getattr(model, "get_output_embeddings", None)
+    if get_in is None:
+        return None
+    try:
+        embedding = get_in()
+        head = get_out() if get_out is not None else None
+    except (AttributeError, NotImplementedError):
+        return None
+    if not isinstance(embedding, nn.Embedding):
+        return None
+    head_weight = getattr(head, "weight", None)
+    if head_weight is not None and head_weight is embedding.weight:
+        return None
+    return embedding
+
+
 class InsufficientVRAMError(RuntimeError):
     """Raised when a budget cannot even hold the always-resident parts."""
 
@@ -364,16 +397,33 @@ class InsufficientVRAMError(RuntimeError):
 _HOST_RAM_RESERVE = 2 * 1024**3
 
 
-def plan_residency(model: nn.Module, vram_budget: Any, *, host_ram_available: Any = None, **kwargs) -> ResidencyPlan:
+def plan_residency(
+    model: nn.Module,
+    vram_budget: Any,
+    *,
+    host_ram_available: Any = None,
+    embedding_on_cpu: bool = True,
+    **kwargs,
+) -> ResidencyPlan:
     """
-    See `_choose_plan` for how the budget is spent. Also records how much RAM
+    See `_choose_plan` for how the budget is spent.
+
+    With `embedding_on_cpu` the input embedding table stays on the CPU when it
+    is not shared with the output head. A lookup is a copy, not arithmetic, so
+    the output is unchanged; on Qwen2.5-7B it frees 1.02 GB of VRAM, about two
+    decoder layers. A tied table is needed by the output head on the GPU
+    anyway, so it stays there.
+
+    Also records how much RAM
     the off-GPU layers have room for (`host_ram_available`, measured when
     omitted, less a 2 GB reserve) so the plan can say when they will not fit.
 
     Only for a model mapped from its files: an ordinarily loaded model already
     holds every weight in RAM, so free RAM says nothing about whether they fit.
     """
-    plan = _choose_plan(model, vram_budget, **kwargs)
+    cpu_anchor_bytes = untied_embedding_bytes(model) if embedding_on_cpu else 0
+    plan = _choose_plan(model, vram_budget, cpu_anchor_bytes=cpu_anchor_bytes, **kwargs)
+    plan.cpu_anchor_bytes = cpu_anchor_bytes
     if not is_file_backed(model):
         return plan
     if host_ram_available is None:
@@ -400,6 +450,7 @@ def _choose_plan(
     mode: str = "exact",
     cpu_layer_ms: Optional[float] = None,
     gpu_layer_ms: Optional[float] = None,
+    cpu_anchor_bytes: int = 0,
 ) -> ResidencyPlan:
     """
     Decides how many decoder layers fit in `vram_budget` and how many must be
@@ -432,7 +483,7 @@ def _choose_plan(
     layer_sizes = [module_bytes(layer) for layer in layers]
     layer_bytes = max(layer_sizes)  # slots must fit the largest layer
     total_model_bytes = module_bytes(model)
-    anchor_bytes = max(0, total_model_bytes - sum(layer_sizes))
+    anchor_bytes = max(0, total_model_bytes - sum(layer_sizes) - cpu_anchor_bytes)
 
     first_param = next(model.parameters(), None)
     dtype_bytes = first_param.element_size() if first_param is not None else 2
@@ -885,9 +936,16 @@ class StreamingModel:
         # A file-backed model's pages are released as soon as their bytes have
         # been copied out (to VRAM or into pinned RAM), so that pinning the
         # next layer sees how much RAM is really available.
-        layer_param_ids = {id(p) for layer in self._layers for p in layer.parameters()}
-        anchor_sources = [p.data for p in self.model.parameters() if id(p) not in layer_param_ids]
-        self._move_anchors_to_device()
+        # The input embedding, when the plan keeps it on the CPU, is read in
+        # place (a few rows per token), so it is neither moved nor released.
+        embedding = _untied_embedding(self.model) if self.plan.cpu_anchor_bytes else None
+        stays_put = {id(p) for layer in self._layers for p in layer.parameters()}
+        if embedding is not None:
+            stays_put |= {id(p) for p in embedding.parameters()}
+            embedding.to("cpu")
+            self._install_embedding_hooks(embedding)
+        anchor_sources = [p.data for p in self.model.parameters() if id(p) not in stays_put]
+        self._move_anchors_to_device(stays_put)
         release_file_pages(self.model, anchor_sources)
         for idx, layer in enumerate(self._layers):
             sources = [p.data for p in layer.parameters()]
@@ -965,12 +1023,12 @@ class StreamingModel:
 
     # -- placement helpers -------------------------------------------------
 
-    def _move_anchors_to_device(self) -> None:
-        layer_param_ids = {id(p) for layer in self._layers for p in layer.parameters()}
+    def _move_anchors_to_device(self, stays_put: set) -> None:
+        """Moves every parameter not in `stays_put` (ids), and the buffers outside layers."""
         layer_buffer_ids = {id(b) for layer in self._layers for b in layer.buffers()}
 
         for param in self.model.parameters():
-            if id(param) not in layer_param_ids and param.device != self.device:
+            if id(param) not in stays_put and param.device != self.device:
                 param.data = param.data.to(self.device)
 
         for module in self.model.modules():
@@ -1105,6 +1163,17 @@ class StreamingModel:
             self._handles.append(
                 layer.register_forward_hook(self._make_layer_post_hook(layer_idx))
             )
+
+    def _install_embedding_hooks(self, embedding: nn.Module) -> None:
+        cpu = torch.device("cpu")
+        self._handles.append(
+            embedding.register_forward_pre_hook(lambda module, args: _to_device(args, cpu))
+        )
+        self._handles.append(
+            embedding.register_forward_hook(
+                lambda module, args, output: _to_device(output, self.device)
+            )
+        )
 
     def _install_cpu_hooks(self, on_cpu: set) -> None:
         # Decode (one token per pass): a CPU layer receives its inputs on the
