@@ -90,6 +90,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         staging_slots=args.staging_slots,
         bandwidth_gb_s=args.bandwidth,
         activation_reserve=args.activation_reserve,
+        prefill_chunk_tokens=args.prefill_chunk,
         mode=_mode(args),
     )
     print()
@@ -109,6 +110,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         staging_slots=args.staging_slots,
         bandwidth_gb_s=args.bandwidth,
         activation_reserve=args.activation_reserve,
+        prefill_chunk_tokens=args.prefill_chunk,
         mode=_mode(args),
     )
     print()
@@ -181,6 +183,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         staging_slots=args.staging_slots,
         bandwidth_gb_s=args.bandwidth,
         mode=_mode(args),
+        prefill_chunk_tokens=args.prefill_chunk,
         pin_reserve=args.pin_reserve,
     )
 
@@ -258,6 +261,17 @@ def build_parser() -> argparse.ArgumentParser:
             "--activation-reserve",
             default="auto",
             help="VRAM held back for transient tensors (default: auto, scales with --context)",
+        )
+        sub.add_argument(
+            "--prefill-chunk",
+            default="auto",
+            help=(
+                "Run prompts this many tokens at a time, so the activation reserve covers one "
+                "chunk instead of the whole context (default: auto = in fast mode the largest "
+                "chunk that buys a GPU layer, whole prompts with --exact; 0 = whole). Chunking "
+                "changes rounding, so with --exact the output matches unchunked generation "
+                "only for short prompts"
+            ),
         )
         sub.add_argument(
             "--bandwidth",

@@ -1,0 +1,32 @@
+Qwen/Qwen2.5-7B-Instruct | NVIDIA GeForce RTX 3060 | 2026-10-22 16:52
+RAM: 9.14 GB available of 15.79 GB
+Mapped in 9.8 s
+
+=== fast === (RAM: 8.82 GB available of 15.79 GB)
+Baseline skipped: the whole model needs 13.60 GB of VRAM, 7.01 GB is free. Output is compared with the first budget instead.
+
+Budget: 7GB
+  plan: 12 resident / 0 streamed / 16 on CPU, weights in VRAM 6.66 GB
+  WARNING: RAM too small. 6.95 GB of layers live off the GPU,
+           but only 5.28 GB of RAM is free for them. The other
+           1.66 GB is re-read from disk every token, or other
+           programs are pushed out of RAM to hold it: expect less than the
+           estimated speed and a system low on memory. Raise the budget or
+           close programs.
+     3.1 tok/s | peak VRAM 6.69 GB | output identical
+
+Budget: 6GB
+  plan: 10 resident / 0 streamed / 18 on CPU, weights in VRAM 5.79 GB
+  WARNING: RAM too small. 7.81 GB of layers live off the GPU,
+           but only 4.98 GB of RAM is free for them. The other
+           2.84 GB is re-read from disk every token, or other
+           programs are pushed out of RAM to hold it: expect less than the
+           estimated speed and a system low on memory. Raise the budget or
+           close programs.
+     2.9 tok/s | peak VRAM 5.82 GB | output same for first 26/32 tokens (CPU rounding)
+
+Configuration            | GPU/stream/CPU |   Peak VRAM |  VRAM saved |  tokens/s |  vs base |    Output
+--------------------------------------------------------------------------------------------------------
+7GB (reference)          |        12/0/16 |     6.69 GB |          -- |       3.1 |       -- | identical
+6GB                      |        10/0/18 |     5.82 GB |       13.0% |       2.9 |    -8.1% | 26/32 same
+RAM: 9.84 GB available of 15.79 GB

@@ -104,6 +104,15 @@ def module_bytes(module: nn.Module, include_buffers: bool = True) -> int:
 _ACTIVATION_FIXED_BYTES = 32 * 1024**2
 _ACTIVATION_ROWS_PER_TOKEN = 4
 
+# Prompt chunk sizes fast mode chooses from, largest first (0 = whole prompt).
+# Processing a prompt in chunks caps that scratch at one chunk's worth
+# (Qwen2.5-3B, 4000-token prompt: peak 461 -> 192 MB with the KV cache), but
+# attention over chunks rounds differently -- greedy output there matched
+# unchunked for 23 of 32 tokens -- so exact mode keeps whole prompts unless
+# asked. Smaller chunks also cost prompt time: every chunk copies each CPU
+# layer into the GPU slot again (7B, 4096 tokens: 4.7 s whole, 9.9 s at 512).
+_FAST_PREFILL_CHUNKS = (0, 2048, 1024, 512)
+
 
 def estimate_activation_reserve_bytes(
     model: nn.Module,
@@ -199,6 +208,8 @@ class ResidencyPlan:
     host_ram_room_bytes: int = 0
     # Anchors kept on the CPU (the input embedding table); not in anchor_bytes.
     cpu_anchor_bytes: int = 0
+    # Prompts run through the model this many tokens at a time (0 = whole).
+    prefill_chunk_tokens: int = 0
 
     @property
     def host_overflow_bytes(self) -> int:
@@ -321,7 +332,12 @@ class ResidencyPlan:
             "",
             f"  weights in VRAM      : {format_bytes(self.vram_weight_bytes)}",
             f"  KV cache reserved    : {format_bytes(self.kv_cache_reserve_bytes)}",
-            f"  activation reserve   : {format_bytes(self.activation_reserve_bytes)}",
+            f"  activation reserve   : {format_bytes(self.activation_reserve_bytes)}"
+            + (
+                f"  (prompts in chunks of {self.prefill_chunk_tokens} tokens)"
+                if self.prefill_chunk_tokens
+                else ""
+            ),
             f"  VRAM saved vs all-in : {format_bytes(self.vram_saved_bytes)}"
             f"  ({self.vram_saved_percent:.1f}%)",
         ]
@@ -414,10 +430,17 @@ def plan_residency(
     *,
     host_ram_available: Any = None,
     embedding_on_cpu: bool = True,
+    prefill_chunk_tokens: Any = "auto",
     **kwargs,
 ) -> ResidencyPlan:
     """
     See `_choose_plan` for how the budget is spent.
+
+    `prefill_chunk_tokens` splits prompts into passes of that many tokens,
+    which shrinks the activation reserve from a whole context's worth to one
+    chunk's. "auto" chunks in fast mode only: chunked attention rounds
+    differently, and exact mode promises the output of an unmodified
+    `generate`. 0 (or None) keeps prompts whole.
 
     With `embedding_on_cpu` the input embedding table stays on the CPU when it
     is not shared with the output head. A lookup is a copy, not arithmetic, so
@@ -433,7 +456,14 @@ def plan_residency(
     holds every weight in RAM, so free RAM says nothing about whether they fit.
     """
     cpu_anchor_bytes = untied_embedding_bytes(model) if embedding_on_cpu else 0
-    plan = _choose_plan(model, vram_budget, cpu_anchor_bytes=cpu_anchor_bytes, **kwargs)
+    if str(prefill_chunk_tokens) == "auto" and kwargs.get("mode", "exact") == "fast":
+        plan = _plan_fast_chunked(model, vram_budget, cpu_anchor_bytes, kwargs)
+    else:
+        chunk = 0 if str(prefill_chunk_tokens) == "auto" else max(0, int(prefill_chunk_tokens or 0))
+        plan = _choose_plan(
+            model, vram_budget, cpu_anchor_bytes=cpu_anchor_bytes, prefill_chunk_tokens=chunk, **kwargs
+        )
+        plan.prefill_chunk_tokens = chunk
     plan.cpu_anchor_bytes = cpu_anchor_bytes
     if not is_file_backed(model):
         return plan
@@ -449,6 +479,50 @@ def plan_residency(
     return plan
 
 
+def _plan_fast_chunked(
+    model: nn.Module, vram_budget: Any, cpu_anchor_bytes: int, kwargs: Dict[str, Any]
+) -> ResidencyPlan:
+    """
+    Fast mode's "auto" prompt chunking: the largest chunk (whole prompt
+    first) that keeps as many layers on the GPU as the smallest one does.
+    Chunking only pays when it buys VRAM for a layer; beyond that, bigger
+    chunks mean fewer passes over the CPU layers' weights per prompt. On
+    Qwen2.5-7B at 7 GB and a 4096-token context that is 1024: 12 GPU layers
+    instead of 11, in 4 passes rather than 8.
+    """
+    kwargs = dict(kwargs)
+    adapter = kwargs.get("adapter")
+    # Measured once, not once per candidate.
+    if kwargs.get("cpu_layer_ms") is None:
+        kwargs["cpu_layer_ms"] = measure_cpu_layer_ms(model, adapter)
+    if kwargs.get("gpu_layer_ms") is None:
+        kwargs["gpu_layer_ms"] = measure_gpu_layer_ms(model, adapter)
+    if kwargs.get("bandwidth_gb_s") is None:
+        from .device.profiler import DeviceProfiler
+
+        kwargs["bandwidth_gb_s"] = DeviceProfiler().benchmark_bandwidth().get("h2d_gb_s", 0.0)
+
+    context = kwargs.get("max_context_tokens", 4096)
+    plans: List[ResidencyPlan] = []
+    error: Optional[InsufficientVRAMError] = None
+    for chunk in _FAST_PREFILL_CHUNKS:
+        if chunk and chunk >= context:
+            continue  # no different from the whole prompt
+        try:
+            plan = _choose_plan(
+                model, vram_budget, cpu_anchor_bytes=cpu_anchor_bytes, prefill_chunk_tokens=chunk, **kwargs
+            )
+        except InsufficientVRAMError as exc:
+            error = exc
+            continue
+        plan.prefill_chunk_tokens = chunk
+        plans.append(plan)
+    if not plans:
+        raise error
+    best = max(len(plan.resident_layers) for plan in plans)
+    return next(plan for plan in plans if len(plan.resident_layers) == best)
+
+
 def _choose_plan(
     model: nn.Module,
     vram_budget: Any,
@@ -462,6 +536,7 @@ def _choose_plan(
     cpu_layer_ms: Optional[float] = None,
     gpu_layer_ms: Optional[float] = None,
     cpu_anchor_bytes: int = 0,
+    prefill_chunk_tokens: int = 0,
 ) -> ResidencyPlan:
     """
     Decides how many decoder layers fit in `vram_budget` and how many must be
@@ -504,7 +579,13 @@ def _choose_plan(
         estimate_kv_cache_bytes(config, max_context_tokens, dtype_bytes) if config is not None else 0
     )
     activation_reserve_bytes = (
-        estimate_activation_reserve_bytes(model, config, dtype_bytes, max_context_tokens)
+        estimate_activation_reserve_bytes(
+            model,
+            config,
+            dtype_bytes,
+            # Scratch scales with the tokens in one pass, not the whole context.
+            min(max_context_tokens, prefill_chunk_tokens) if prefill_chunk_tokens else max_context_tokens,
+        )
         if str(activation_reserve) == "auto"
         else parse_bytes(activation_reserve)
     )
@@ -896,6 +977,8 @@ class StreamingModel:
         self._handles: List[Any] = []
         # The model's class while a CPU embedding has it report the device.
         self._model_class: Optional[type] = None
+        # `generation_config.prefill_chunk_size` before the plan set it.
+        self._saved_chunk: Optional[Tuple[Any, Any]] = None
 
         # Host-side master copies of streamed parameters, by layer then name.
         self._host_params: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -978,6 +1061,14 @@ class StreamingModel:
         if on_cpu:
             self._install_cpu_hooks(on_cpu)
 
+        generation_config = getattr(self.model, "generation_config", None)
+        if self.plan.prefill_chunk_tokens and generation_config is not None:
+            self._saved_chunk = (
+                generation_config,
+                getattr(generation_config, "prefill_chunk_size", None),
+            )
+            generation_config.prefill_chunk_size = self.plan.prefill_chunk_tokens
+
         self._installed = True
         return self
 
@@ -991,6 +1082,10 @@ class StreamingModel:
         if self._model_class is not None:
             self.model.__class__ = self._model_class
             self._model_class = None
+        if self._saved_chunk is not None:
+            generation_config, previous = self._saved_chunk
+            generation_config.prefill_chunk_size = previous
+            self._saved_chunk = None
 
         # Rebind every streamed parameter to its host copy so the model is a
         # plain CPU/GPU model again rather than pointing into freed slots.
@@ -1252,6 +1347,10 @@ class StreamingModel:
                 for name, param in params.items():
                     slot[name].copy_(host[name])
                     param.data = slot[name]
+                # A chunk after the first attends to what earlier chunks left
+                # in this layer's cache, which the post hook moved to the CPU.
+                cache_idx = getattr(getattr(module, "self_attn", None), "layer_idx", layer_idx)
+                _move_layer_cache(kwargs.get("past_key_values"), cache_idx, self.device)
                 self._on_gpu_now.add(layer_idx)
                 self.prefill_layer_runs += 1
                 self.transfer_bytes_total += self.plan.layer_bytes

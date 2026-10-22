@@ -116,6 +116,7 @@ def benchmark_budgets(
     staging_slots: int = 2,
     bandwidth_gb_s: Optional[float] = None,
     mode: str = "exact",
+    prefill_chunk_tokens: Any = "auto",
     pin_reserve: Any = "2GB",
     verbose: bool = True,
 ) -> List[RunResult]:
@@ -186,6 +187,7 @@ def benchmark_budgets(
             staging_slots=staging_slots,
             bandwidth_gb_s=bandwidth_gb_s,
             mode=mode,
+            prefill_chunk_tokens=prefill_chunk_tokens,
         )
         if verbose:
             cpu_text = f" / {len(plan.cpu_layers)} on CPU" if plan.cpu_layers else ""

@@ -216,13 +216,19 @@ In this order, because each item is worthless without the one before it:
 3. **Activation reserve** — transient tensors of the prompt pass, which grow
    with prompt length. `auto` is sized from measurement (32 MB plus four MLP
    rows per `--context` token); override with `--activation-reserve`.
+   With `--prefill-chunk N` prompts run N tokens at a time and the reserve
+   covers one chunk instead of the whole context.
 4. **Staging slots** — the GPU buffers streamed layers rotate through. Two is
    enough to overlap a transfer with the previous layer's compute.
 5. **Resident layers** — as many as the remainder holds.
 
 In fast mode, when the CPU wins, step 4 reserves a single slot (used only to
 run prompts on the GPU) and step 2 only covers the resident layers: CPU layers
-keep their KV cache in host RAM.
+keep their KV cache in host RAM. Fast mode also chunks prompts when that buys
+a GPU layer, picking the largest chunk (whole, 2048, 1024, 512 tokens) that
+does: smaller chunks re-copy every CPU layer into the slot more often. Exact
+mode keeps prompts whole, because chunked attention rounds differently and
+long prompts would no longer match an unmodified `generate`.
 
 If step 1–3 already exceed the budget, ParamMap refuses with an explanation
 rather than failing later with an out-of-memory error.

@@ -1,0 +1,9 @@
+Qwen/Qwen2.5-7B-Instruct | NVIDIA GeForce RTX 3060 | 2026-10-22 16:48
+budget 7GB (fast): 12 resident / 0 streamed / 16 cpu | planned reserve 106.0 MB | prefill chunk 512
+hidden 3584, intermediate 18944, heads 28/4, vocab 152064, attn sdpa
+
+ tokens |     before |       peak |     KV est |  transient |   estimate |    time
+     16 |    6.69 GB |    6.69 GB |     480 KB |     4.7 MB |    34.3 MB |    7.9s
+    512 |    6.69 GB |    6.77 GB |    12.1 MB |    70.7 MB |   106.0 MB |    2.0s
+   2048 |    6.69 GB |    6.81 GB |    48.1 MB |    81.0 MB |   106.0 MB |    5.4s
+   4096 |    6.69 GB |    6.87 GB |    96.1 MB |    91.0 MB |   106.0 MB |    9.9s

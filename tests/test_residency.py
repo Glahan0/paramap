@@ -590,6 +590,92 @@ def test_cpu_layers_handle_prompt_then_decode(prompt_slot):
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
+def _wide_qwen2():
+    """MLP wide enough that prompt scratch outweighs a layer."""
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(8)
+    config = Qwen2Config(
+        vocab_size=64, hidden_size=32, intermediate_size=4096, num_hidden_layers=6,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128,
+    )
+    return Qwen2ForCausalLM(config).eval()
+
+
+_FAST_TIMINGS = dict(max_context_tokens=4096, bandwidth_gb_s=10.0, cpu_layer_ms=1.0, gpu_layer_ms=0.01)
+
+
+def test_exact_mode_keeps_prompts_whole():
+    model = _wide_qwen2()
+    plan = plan_residency(model, "1GB", **_FAST_TIMINGS)
+
+    assert plan.prefill_chunk_tokens == 0
+    assert plan.activation_reserve_bytes == estimate_activation_reserve_bytes(model, model.config, 4, 4096)
+
+
+def test_fast_mode_keeps_prompts_whole_when_chunking_buys_nothing():
+    plan = plan_residency(_wide_qwen2(), "10GB", mode="fast", **_FAST_TIMINGS)
+
+    assert plan.prefill_chunk_tokens == 0
+    assert plan.is_fully_resident
+
+
+def test_fast_mode_picks_the_largest_chunk_that_keeps_the_most_layers():
+    model = _wide_qwen2()
+    budget = "100MB"
+    explicit = {}
+    for chunk in (0, 2048, 1024, 512):
+        try:
+            explicit[chunk] = plan_residency(
+                model, budget, mode="fast", prefill_chunk_tokens=chunk, **_FAST_TIMINGS
+            )
+        except InsufficientVRAMError:
+            pass
+    best = max(len(plan.resident_layers) for plan in explicit.values())
+    expected = next(c for c in (0, 2048, 1024, 512) if c in explicit and len(explicit[c].resident_layers) == best)
+
+    auto = plan_residency(model, budget, mode="fast", **_FAST_TIMINGS)
+
+    # The budget has to make the choice matter for the test to say anything.
+    assert expected != 0
+    assert auto.prefill_chunk_tokens == expected
+    assert len(auto.resident_layers) == best
+    assert auto.activation_reserve_bytes == estimate_activation_reserve_bytes(
+        model, model.config, 4, expected
+    )
+
+
+@needs_cuda
+def test_chunked_prompt_through_cpu_layers_matches_generate():
+    """A later chunk runs a CPU layer on the GPU against the cache earlier chunks moved to the CPU."""
+    device = torch.device("cuda")
+    model = _tiny_qwen2(device)
+    prompt = torch.randint(0, 64, (1, 13), device=device)
+
+    def generate():
+        return model.generate(
+            input_ids=prompt,
+            attention_mask=torch.ones_like(prompt),
+            max_new_tokens=6,
+            min_new_tokens=6,
+            do_sample=False,
+        )
+
+    expected = generate()
+    plan = _cpu_plan(model, resident_count=2, prompt_slot=True)
+    plan.prefill_chunk_tokens = 4
+    with StreamingModel(model, plan, device=device) as streaming:
+        assert model.generation_config.prefill_chunk_size == 4
+        actual = generate()
+        prefill_runs = streaming.stats()["prefill_layer_runs"]
+
+    assert model.generation_config.prefill_chunk_size is None
+    # 13 tokens in chunks of 4: three multi-token passes and a 1-token one,
+    # which runs on the CPU like decode.
+    assert prefill_runs == 3 * len(plan.cpu_layers)
+    assert torch.equal(actual, expected)
+
+
 
 # ---------------------------------------------------------------------------
 # The input embedding stays on the CPU
