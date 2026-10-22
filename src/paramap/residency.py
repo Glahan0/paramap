@@ -704,8 +704,8 @@ def _plan_fast(
                 its own GPU compute, whichever is longer (they overlap).
 
 `cpu_layer_ms` is a standalone timing; in real decode a CPU layer also pays
-for hooks, bus crossings and attention over its cache, so it is scaled by
-_CPU_IN_DECODE_FACTOR. And because only the exact plan guarantees identical
+for its hooks and for moving its inputs off the GPU, a fixed cost per layer
+added as _CPU_IN_DECODE_MS. And because only the exact plan guarantees identical
 output, the CPU plan must be predicted at least _FAST_MIN_SPEEDUP faster to be
 chosen: on Qwen2.5-0.5B the two measured within 3% of each other while the CPU
 plan's output diverged after 3 tokens, which is all cost and no gain.
@@ -727,7 +727,7 @@ plan's output diverged after 3 tokens, which is all cost and no gain.
             "model."
         )
 
-    cpu_layer_ms = cpu_layer_ms * _CPU_IN_DECODE_FACTOR
+    cpu_layer_ms = cpu_layer_ms + _CPU_IN_DECODE_MS
 
     # cpu: every GPU layer is resident and carries its own KV cache. One
     # staging slot is kept back for prompts: a multi-token pass costs a CPU
@@ -782,10 +782,13 @@ plan's output diverged after 3 tokens, which is all cost and no gain.
     )
 
 
-# A CPU layer's cost in real decode over its standalone timing: hooks, the
-# hidden state crossing the bus, attention over the cache. Measured 1.39x on
-# Qwen2.5-3B and 1.6x on Qwen2.5-0.5B (RTX 3060, Ryzen 5 5500).
-_CPU_IN_DECODE_FACTOR = 1.5
+# A CPU layer's cost in real decode beyond its standalone timing: its hooks and
+# moving its inputs off the GPU. Measured as the slope of decode time over the
+# number of CPU layers (experiments/cpu_layer_cost.py; RTX 3060, Ryzen 5 5500):
+# +0.4-0.6 ms on Qwen2.5-0.5B, -0.25 ms on 3B, +0.49 ms on 7B. It does not
+# scale with the layer, so the earlier factor (1.5x) overcharged large models:
+# their in-decode cost is 0.96-1.03x standalone.
+_CPU_IN_DECODE_MS = 0.5
 
 # The CPU plan gives up bit-identical output, so it has to be clearly faster.
 _FAST_MIN_SPEEDUP = 1.15

@@ -1,0 +1,8 @@
+Qwen/Qwen2.5-3B-Instruct | NVIDIA GeForce RTX 3060 | 2026-10-22 17:11
+standalone: cpu layer 5.51 ms, gpu layer 1.50 ms
+
+ budget |  mode | GPU/stream/CPU |  est ms | meas ms |   diff | tok/s
+    5GB |  fast |         28/0/8 |    90.1 |    96.3 |   +6.2 | 10.4
+    5GB | exact |        26/10/0 |   154.8 |   136.9 |  -17.9 | 7.3
+    2GB |  fast |         8/0/28 |   180.2 |   200.2 |  +20.0 | 5.0
+    2GB | exact |         6/30/0 |   355.8 |   350.4 |   -5.4 | 2.9

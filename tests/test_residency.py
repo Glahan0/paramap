@@ -507,7 +507,7 @@ def test_cpu_layers_on_cuda_match_the_gpu_closely(resident_count):
 
 def test_fast_plan_keeps_exactness_unless_the_cpu_is_clearly_faster():
     """Identical output is worth something: a marginal CPU win must not buy it away."""
-    from paramap.residency import _CPU_IN_DECODE_FACTOR, _FAST_MIN_SPEEDUP
+    from paramap.residency import _CPU_IN_DECODE_MS, _FAST_MIN_SPEEDUP
 
     model = _TinyLM(num_layers=8)
     layer_bytes, anchors = _sizes(model)
@@ -519,7 +519,7 @@ def test_fast_plan_keeps_exactness_unless_the_cpu_is_clearly_faster():
     def plan_with_cpu_speedup(speedup):
         cpu_ms_in_decode = stream_ms / speedup / 6
         return _fast_plan(
-            model, budget, cpu_layer_ms=cpu_ms_in_decode / _CPU_IN_DECODE_FACTOR,
+            model, budget, cpu_layer_ms=cpu_ms_in_decode - _CPU_IN_DECODE_MS,
             bandwidth_gb_s=bandwidth,
         )
 

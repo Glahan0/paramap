@@ -1,0 +1,11 @@
+Qwen/Qwen2.5-0.5B-Instruct | NVIDIA GeForce RTX 3060 | 2026-10-22 16:58
+standalone: cpu layer 1.41 ms, gpu layer 1.76 ms
+
+cpu layers |  ms/token
+         2 |      37.8
+         8 |      39.8
+        14 |      40.5
+        20 |      41.9
+
+slope 0.22 ms per CPU layer, intercept 37.6 ms (all on GPU)
+CPU layer in decode: 1.98 ms = 1.40 x standalone (+0.56 ms)
