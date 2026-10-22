@@ -97,28 +97,39 @@ def module_bytes(module: nn.Module, include_buffers: bool = True) -> int:
     return total
 
 
+# Measured with experiments/activation_peak.py on Qwen2.5-0.5B/3B/7B (RTX 3060,
+# sdpa): a generate needs ~13 MB plus 3.5-3.7 x intermediate_size elements per
+# prompt token beyond the weights and KV cache -- the MLP's gate, up and product
+# rows for the whole prompt. The constants round both up.
+_ACTIVATION_FIXED_BYTES = 32 * 1024**2
+_ACTIVATION_ROWS_PER_TOKEN = 4
+
+
 def estimate_activation_reserve_bytes(
     model: nn.Module,
     config: Any,
     dtype_bytes: int = 2,
+    max_context_tokens: int = 4096,
 ) -> int:
     """
     Headroom to leave for the transient tensors of a forward pass.
 
-    A heuristic, deliberately a modest one: during decode the per-token
-    activations are negligible and the only sizeable transient is the output
-    logits row (vocabulary x dtype). The term that actually scales is prefill
-    scratch, which tracks model size, so this allows a small fraction of the
-    weights plus room for a batch of logits rows.
+    Decode activations are negligible; the peak is the prompt pass, whose MLP
+    scratch grows linearly with prompt length (a prompt can be as long as the
+    context). Sized from measurement: on Qwen2.5-7B a 4096-token prompt needs
+    558 MB, and the earlier guess of 2% of the weights (295 MB) let the peak
+    pass a 7 GB budget.
 
-    It is a starting point, not a measurement. `paramap.benchmark` reports the
-    real peak VRAM, so tune `activation_reserve` from that if a workload needs
-    more or can live with less.
+    Covers `generate`, which computes logits for the last position only; a
+    plain forward over a long sequence also holds its full logits
+    (tokens x vocabulary in fp32) and needs more.
     """
-    total = module_bytes(model)
-    vocab_size = getattr(config, "vocab_size", 0) if config is not None else 0
-    logits_headroom = vocab_size * dtype_bytes * 16
-    return max(64 * 1024**2, int(0.02 * total) + logits_headroom)
+    intermediate = getattr(config, "intermediate_size", None) if config is not None else None
+    if not intermediate:
+        # No MLP width to go on: fall back to a fraction of the weights.
+        return max(64 * 1024**2, int(0.02 * module_bytes(model)))
+    per_token = _ACTIVATION_ROWS_PER_TOKEN * intermediate * dtype_bytes
+    return _ACTIVATION_FIXED_BYTES + max_context_tokens * per_token
 
 
 def estimate_kv_cache_bytes(config: Any, max_context_tokens: int, dtype_bytes: int = 2) -> int:
@@ -493,7 +504,7 @@ def _choose_plan(
         estimate_kv_cache_bytes(config, max_context_tokens, dtype_bytes) if config is not None else 0
     )
     activation_reserve_bytes = (
-        estimate_activation_reserve_bytes(model, config, dtype_bytes)
+        estimate_activation_reserve_bytes(model, config, dtype_bytes, max_context_tokens)
         if str(activation_reserve) == "auto"
         else parse_bytes(activation_reserve)
     )

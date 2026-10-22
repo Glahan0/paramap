@@ -213,8 +213,9 @@ In this order, because each item is worthless without the one before it:
 1. **Anchors** — embeddings, final norm, output head. Needed every token.
 2. **KV cache** for `--context` tokens, sized from the key/value head count so
    grouped-query models are not overcharged.
-3. **Activation reserve** — transient tensors. `auto` scales with model size;
-   override with `--activation-reserve` once `bench` has told you the real peak.
+3. **Activation reserve** — transient tensors of the prompt pass, which grow
+   with prompt length. `auto` is sized from measurement (32 MB plus four MLP
+   rows per `--context` token); override with `--activation-reserve`.
 4. **Staging slots** — the GPU buffers streamed layers rotate through. Two is
    enough to overlap a transfer with the previous layer's compute.
 5. **Resident layers** — as many as the remainder holds.

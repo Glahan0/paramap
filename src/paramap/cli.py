@@ -257,7 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--activation-reserve",
             default="auto",
-            help="VRAM held back for transient tensors (default: auto, scales with the model)",
+            help="VRAM held back for transient tensors (default: auto, scales with --context)",
         )
         sub.add_argument(
             "--bandwidth",

@@ -17,6 +17,7 @@ from paramap.residency import (
     InsufficientVRAMError,
     ResidencyPlan,
     StreamingModel,
+    estimate_activation_reserve_bytes,
     estimate_kv_cache_bytes,
     format_bytes,
     module_bytes,
@@ -199,6 +200,32 @@ def test_kv_cache_estimate_respects_grouped_query_attention():
 
 def test_kv_cache_estimate_returns_zero_for_an_opaque_config():
     assert estimate_kv_cache_bytes(SimpleNamespace(), 1024) == 0
+
+
+# Transient VRAM measured by experiments/activation_peak.py: (config, prompt
+# tokens, bytes beyond weights and KV cache).
+_MEASURED_ACTIVATION_PEAKS = [
+    (SimpleNamespace(intermediate_size=4864), 4096, int(143.0 * 1024**2)),  # Qwen2.5-0.5B
+    (SimpleNamespace(intermediate_size=11008), 4096, int(323.9 * 1024**2)),  # Qwen2.5-3B
+    (SimpleNamespace(intermediate_size=18944), 2048, int(280.8 * 1024**2)),  # Qwen2.5-7B
+    (SimpleNamespace(intermediate_size=18944), 4096, int(557.8 * 1024**2)),  # Qwen2.5-7B
+    (SimpleNamespace(intermediate_size=18944), 16, int(12.9 * 1024**2)),  # Qwen2.5-7B
+]
+
+
+@pytest.mark.parametrize("config, tokens, measured", _MEASURED_ACTIVATION_PEAKS)
+def test_activation_reserve_covers_the_measured_peak(config, tokens, measured):
+    reserve = estimate_activation_reserve_bytes(_TinyLM(), config, 2, tokens)
+
+    assert measured <= reserve <= 1.3 * measured + 32 * 1024**2
+
+
+def test_activation_reserve_grows_with_the_context():
+    config = SimpleNamespace(intermediate_size=1024)
+    short = estimate_activation_reserve_bytes(_TinyLM(), config, 2, 1024)
+    long = estimate_activation_reserve_bytes(_TinyLM(), config, 2, 2048)
+
+    assert long - short == 1024 * 4 * 1024 * 2
 
 
 # ---------------------------------------------------------------------------
