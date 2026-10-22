@@ -363,8 +363,8 @@ class ResidencyPlan:
             lines += [
                 "  Prompt processing    : CPU layers run on the GPU through a staging slot"
                 if self.staging_slots
-                else "  Prompt processing    : on the CPU (no room for a staging slot; long"
-                " prompts will be slow)",
+                else "  Prompt processing    : on the CPU in fp32 (no room for a staging slot;"
+                " long prompts are slow: ~14 s for 512 tokens on Qwen2.5-3B)",
             ]
         if self.host_overflow_bytes:
             lines += ["", *self.ram_warning().splitlines()]
@@ -790,6 +790,12 @@ plan's output diverged after 3 tokens, which is all cost and no gain.
 # their in-decode cost is 0.96-1.03x standalone.
 _CPU_IN_DECODE_MS = 0.5
 
+# A prompt this long that has to run on the CPU (no staging slot) runs in fp32:
+# CPU bf16 matmuls are slow without native support. Qwen2.5-3B, one layer:
+# 512 tokens 1463 -> 417 ms, 2000 tokens 6152 -> 1157 ms with the conversion;
+# at 64 tokens the two are even (190 / 198 ms).
+_CPU_FP32_PROMPT_TOKENS = 128
+
 # The CPU plan gives up bit-identical output, so it has to be clearly faster.
 _FAST_MIN_SPEEDUP = 1.15
 
@@ -873,8 +879,10 @@ def _time_layer(
 # The runtime
 # ---------------------------------------------------------------------------
 
-def _move_layer_cache(cache: Any, layer_idx: int, device: torch.device) -> None:
-    """Moves one layer's KV cache entries to `device` (no-op without a cache)."""
+def _move_layer_cache(
+    cache: Any, layer_idx: int, device: torch.device, dtype: Optional[torch.dtype] = None
+) -> None:
+    """Moves one layer's KV cache entries to `device` (and `dtype`); no-op without a cache."""
     if cache is None:
         return
     layers = getattr(cache, "layers", None)
@@ -884,15 +892,17 @@ def _move_layer_cache(cache: Any, layer_idx: int, device: torch.device) -> None:
             for attr in ("keys", "values"):
                 tensor = getattr(entry, attr, None)
                 if torch.is_tensor(tensor):
-                    setattr(entry, attr, tensor.to(device))
+                    setattr(entry, attr, tensor.to(device=device, dtype=dtype))
             if hasattr(entry, "device"):
                 entry.device = device
+            if dtype is not None and hasattr(entry, "dtype"):
+                entry.dtype = dtype
         return
     # transformers < 4.56 kept parallel lists.
     for attr in ("key_cache", "value_cache"):
         tensors = getattr(cache, attr, None)
         if tensors is not None and layer_idx < len(tensors) and torch.is_tensor(tensors[layer_idx]):
-            tensors[layer_idx] = tensors[layer_idx].to(device)
+            tensors[layer_idx] = tensors[layer_idx].to(device=device, dtype=dtype)
 
 
 def _clear_cuda_error() -> None:
@@ -916,6 +926,19 @@ def _clear_cuda_error() -> None:
             return
         except (OSError, AttributeError):
             continue
+
+
+def _to_dtype(value: Any, dtype: torch.dtype) -> Any:
+    """Casts every floating-point tensor inside (nested) args/kwargs/outputs."""
+    if torch.is_tensor(value):
+        return value.to(dtype) if value.is_floating_point() else value
+    if isinstance(value, tuple):
+        return tuple(_to_dtype(v, dtype) for v in value)
+    if isinstance(value, list):
+        return [_to_dtype(v, dtype) for v in value]
+    if isinstance(value, dict):
+        return {k: _to_dtype(v, dtype) for k, v in value.items()}
+    return value
 
 
 def _to_device(value: Any, device: torch.device) -> Any:
@@ -974,6 +997,9 @@ class StreamingModel:
         self._prefill_slot: Optional[Dict[str, torch.Tensor]] = None
         self._on_gpu_now: set = set()
         self.prefill_layer_runs = 0
+        # CPU layers running a prompt in fp32 right now (no slot), by original dtype.
+        self._upcast_now: Dict[int, torch.dtype] = {}
+        self.fp32_prompt_layer_runs = 0
 
         self._layers = self.adapter.get_layers(model)
         self._installed = False
@@ -1105,6 +1131,7 @@ class StreamingModel:
                     param.data = host[name]
         self._cpu_host.clear()
         self._on_gpu_now.clear()
+        self._upcast_now.clear()
         self._prefill_slot = None
 
         for param, original in self._originals:
@@ -1358,7 +1385,23 @@ class StreamingModel:
                 self.prefill_layer_runs += 1
                 self.transfer_bytes_total += self.plan.layer_bytes
                 return _to_device(args, self.device), _to_device(kwargs, self.device)
-            return _to_device(args, cpu), _to_device(kwargs, cpu)
+            args, kwargs = _to_device(args, cpu), _to_device(kwargs, cpu)
+            host = self._cpu_host[layer_idx]
+            dtype = next(iter(host.values())).dtype if host else torch.float32
+            if (
+                is_prompt
+                and hidden.shape[1] >= _CPU_FP32_PROMPT_TOKENS
+                and dtype in (torch.bfloat16, torch.float16)
+            ):
+                # No slot: the prompt runs here. Without native bf16 GEMM the
+                # CPU is ~5x faster in fp32 even counting the conversion, so
+                # the layer runs on a temporary fp32 copy of its weights.
+                for name, param in params.items():
+                    param.data = host[name].float()
+                self._upcast_now[layer_idx] = dtype
+                self.fp32_prompt_layer_runs += 1
+                return _to_dtype(args, torch.float32), _to_dtype(kwargs, torch.float32)
+            return args, kwargs
 
         return hook
 
@@ -1375,6 +1418,15 @@ class StreamingModel:
                 cache_idx = getattr(getattr(module, "self_attn", None), "layer_idx", layer_idx)
                 _move_layer_cache(kwargs.get("past_key_values"), cache_idx, cpu)
                 return output
+            dtype = self._upcast_now.pop(layer_idx, None)
+            if dtype is not None:
+                host = self._cpu_host[layer_idx]
+                for name, param in params.items():
+                    param.data = host[name]
+                # Decode runs in the original dtype and appends to this cache.
+                cache_idx = getattr(getattr(module, "self_attn", None), "layer_idx", layer_idx)
+                _move_layer_cache(kwargs.get("past_key_values"), cache_idx, cpu, dtype)
+                output = _to_dtype(output, dtype)
             return _to_device(output, self.device) if group_end else output
 
         return hook
@@ -1476,6 +1528,8 @@ class StreamingModel:
             "forward_passes": self.tokens_observed,
             # CPU-layer executions moved to the GPU because the pass was a prompt.
             "prefill_layer_runs": self.prefill_layer_runs,
+            # Prompt passes run on the CPU in fp32 because there was no slot.
+            "fp32_prompt_layer_runs": self.fp32_prompt_layer_runs,
             "bytes_transferred": self.transfer_bytes_total,
             "vram_weight_bytes": self.plan.vram_weight_bytes,
             "host_weight_bytes": self.plan.host_weight_bytes,

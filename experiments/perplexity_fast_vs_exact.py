@@ -88,6 +88,8 @@ def main():
                         help="skip the baseline run if its logits are already in --cache-dir")
     parser.add_argument("--skip-exact", action="store_true",
                         help="skip the exact-mode sanity check (slowest configuration)")
+    parser.add_argument("--only", default=None,
+                        help="comma-separated label prefixes to run, e.g. 'baseline,fast 0.8GB'")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -111,6 +113,9 @@ def main():
     ]
     if args.skip_exact:
         configs = [c for c in configs if not c[0].startswith("exact")]
+    if args.only:
+        prefixes = [p.strip() for p in args.only.split(",") if p.strip()]
+        configs = [c for c in configs if any(c[0].startswith(p) for p in prefixes)]
 
     def base_path(kind, i):
         return os.path.join(cache_dir, f"{kind}{i}.pt")

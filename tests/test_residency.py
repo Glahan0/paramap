@@ -590,6 +590,39 @@ def test_cpu_layers_handle_prompt_then_decode(prompt_slot):
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
+@needs_cuda
+def test_long_prompt_without_a_slot_runs_in_fp32_and_hands_back_bf16():
+    """No slot: a long prompt runs CPU layers on fp32 copies; weights and cache stay bf16."""
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    from paramap.residency import _CPU_FP32_PROMPT_TOKENS
+
+    device = torch.device("cuda")
+    torch.manual_seed(9)
+    config = Qwen2Config(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=6,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=512,
+    )
+    model = Qwen2ForCausalLM(config).to(device, torch.bfloat16).eval()
+    prompt = torch.randint(0, 64, (1, _CPU_FP32_PROMPT_TOKENS + 32))
+    expected, _ = _prompt_then_decode(model, prompt, steps=4, device=device)
+
+    plan = _cpu_plan(model, resident_count=2, prompt_slot=False)
+    with StreamingModel(model, plan, device=device) as streaming:
+        actual, cache = _prompt_then_decode(model, prompt, steps=4, device=device)
+        stats = streaming.stats()
+        for layer_idx in plan.cpu_layers:
+            param = next(model.model.layers[layer_idx].parameters())
+            assert param.device.type == "cpu" and param.dtype == torch.bfloat16
+            assert cache.layers[layer_idx].keys.dtype == torch.bfloat16
+
+    # The prompt pass only; decode passes are one token and stay in bf16.
+    assert stats["fp32_prompt_layer_runs"] == len(plan.cpu_layers)
+    assert stats["prefill_layer_runs"] == 0
+    # bf16 logits: CPU vs GPU and fp32 vs bf16 differ in the last bits only.
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.05, atol=0.05)
+
+
 def _wide_qwen2():
     """MLP wide enough that prompt scratch outweighs a layer."""
     from transformers import Qwen2Config, Qwen2ForCausalLM

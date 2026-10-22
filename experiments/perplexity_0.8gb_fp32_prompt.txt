@@ -1,0 +1,6 @@
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (298938 > 131072). Running this sequence through the model will result in indexing errors
+Qwen/Qwen2.5-3B-Instruct: 16384 prefill tokens, 8x256 decode tokens; baseline logits in C:\Users\user\AppData\Local\Temp\paramap_ppl_51_dnd92
+
+Configuration          | GPU/str/CPU |     PPL |     dPPL | KL nats/tok |   top-1 | dec dPPL |  decode KL | dec top-1 | bit-identical | time
+baseline (all GPU)     |      36/0/0 |   (ref) |       -- |          -- |      -- |       -- |         -- |        -- | -- | 125s
+fast 0.8GB (CPU)       |      0/0/36 |  10.275 |  +0.184% |    1.36e-03 |  98.15% |  -0.028% |   1.44e-03 |    97.79% | prefill False, decode False | 857s  [baseline PPL 10.256, decode PPL 14.941]

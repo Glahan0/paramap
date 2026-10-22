@@ -1,0 +1,9 @@
+exact                  does not fit in 800MB
+fast                     0/0/36 GPU/stream/CPU | prompt    25 tokens: first token    2.95 s | decode  4.13 tok/s
+fast                     0/0/36 GPU/stream/CPU | prompt   128 tokens: first token    7.01 s | decode  4.23 tok/s
+fast                     0/0/36 GPU/stream/CPU | prompt   512 tokens: first token   14.09 s | decode  4.00 tok/s
+fast                     0/0/36 GPU/stream/CPU | prompt  2000 tokens: first token   46.15 s | decode  3.33 tok/s
+fast, prompts on CPU     0/0/36 GPU/stream/CPU | prompt    25 tokens: first token    3.45 s | decode  3.97 tok/s
+fast, prompts on CPU     0/0/36 GPU/stream/CPU | prompt   128 tokens: first token    6.28 s | decode  3.96 tok/s
+fast, prompts on CPU     0/0/36 GPU/stream/CPU | prompt   512 tokens: first token   14.22 s | decode  3.97 tok/s
+fast, prompts on CPU     0/0/36 GPU/stream/CPU | prompt  2000 tokens: first token   46.58 s | decode  3.27 tok/s

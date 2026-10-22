@@ -5,6 +5,7 @@ Prompts are the start of WikiText-2 (test), cut to each length. "first token"
 is the prompt pass alone; decode is the median rate over the following tokens.
 
     python experiments/prompt_latency.py --budget 2GB --lengths 25,512,2000
+    python experiments/prompt_latency.py --budget 800MB   # no slot: prompts on the CPU
 """
 
 import argparse
@@ -14,7 +15,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from paramap.residency import StreamingModel, plan_residency
+from paramap.residency import InsufficientVRAMError, StreamingModel, plan_residency
 
 
 @torch.no_grad()
@@ -59,7 +60,11 @@ def main():
         ("fast", dict(mode="fast")),
         ("fast, prompts on CPU", dict(mode="fast")),
     ]:
-        plan = plan_residency(model, args.budget, max_context_tokens=max(lengths) + 64, **kwargs)
+        try:
+            plan = plan_residency(model, args.budget, max_context_tokens=max(lengths) + 64, **kwargs)
+        except InsufficientVRAMError:
+            print(f"{label:<22} does not fit in {args.budget}", flush=True)
+            continue
         if label.endswith("on CPU"):
             if not plan.cpu_layers:
                 continue

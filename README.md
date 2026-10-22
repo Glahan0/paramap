@@ -165,7 +165,10 @@ multi-token passes, handing their KV cache back to the CPU afterwards. At 2 GB:
 | 2000 tokens | 1.21 s | 185.6 s | 0.74 s |
 
 At budgets too small for the slot (0.8 GB here) prompts fall back to the CPU,
-and `paramap plan` says so.
+and `paramap plan` says so. Prompts of 128 tokens or more then run on a
+temporary fp32 copy of each layer: without native bf16 support the CPU is
+much faster in fp32, conversion included (0.8 GB, same session: 512 tokens
+65.4 → 14.1 s, 2000 tokens 274.6 → 46.2 s). Weights and KV cache stay bf16.
 
 **Quality.** WikiText-2 test, 16,384 tokens teacher-forced in 512-token chunks
 (prompt path) and 2,048 tokens fed one at a time through the KV cache (decode
