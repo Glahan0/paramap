@@ -32,3 +32,10 @@ maps/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Personal notes kept out of the repo
+yapilanlar.md
+README.tr.md
+docs/
+legacy/PLAN.md
+.claude/

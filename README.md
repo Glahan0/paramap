@@ -3,7 +3,8 @@
 **Run local LLMs under a VRAM budget you choose.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Bilingual: EN/TR](https://img.shields.io/badge/docs-EN%20%7C%20TR-orange.svg)](README.tr.md)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Status: work in progress](https://img.shields.io/badge/status-work%20in%20progress-yellow.svg)
 
 Tell ParamMap how much VRAM it may use. It keeps as many decoder layers in GPU
 memory as that allows and holds the rest in host RAM. Every parameter is kept;
@@ -36,6 +37,33 @@ tokens/s <= pcie_bandwidth / streamed_bytes_per_token
   can have.
 - **Run a model bigger than your VRAM.** Weights are loaded to host RAM first
   and never need to fit on the GPU all at once.
+
+---
+
+## Status
+
+This is a personal research project and a work in progress. Everything below
+was measured on one machine (RTX 3060 8 GB, Ryzen 5 5500, 16 GB RAM) with the
+Qwen2.5 family.
+
+**Done**
+
+- Budget planner and streaming runtime whose output is identical to the all-GPU run (exact mode)
+- Fast mode: layers that did not fit are computed on the CPU, and the planner picks the CPU only when it predicts that is faster
+- Prompts for CPU layers run on the GPU through a staging slot. When no slot fits, they run on the CPU in fp32
+- Disk tier: weights are memory-mapped from safetensors, so Qwen2.5-7B (14.2 GB) runs on an 8 GB card
+- Untied input embedding kept on the CPU, an activation reserve sized from measurement, chunked prefill
+- A warning when the layers kept off the GPU do not fit in free RAM
+- Perplexity and KL measurements of fast mode against the all-GPU run
+
+**Open**
+
+- Stream smaller bytes (int8/int4 weights dequantised on the GPU): the
+  largest remaining speed lever, at the cost of redefining "identical"
+- Move the remaining anchors (tied embedding / `lm_head`) off the GPU
+- Test architectures other than Qwen2.5 (Llama, Mistral, Gemma)
+- Measure fast mode on 7B at 4–5 GB on a machine with more free RAM
+- A UI with a budget slider and live VRAM/speed telemetry
 
 ---
 
@@ -199,6 +227,26 @@ same. To decide, it times one layer on the CPU and one on the GPU; its
 estimates landed within 1% of the measured speed (3B at 5 GB: 9.8 estimated,
 9.9 measured; 0.5B at 600 MB: 19.6 vs 19.7).
 
+### Qwen2.5-7B: a model larger than VRAM
+
+bf16, 14.2 GB of weights, same RTX 3060 8 GB and 16 GB of system RAM, 32
+generated tokens. The model does not fit on the GPU, so there is no all-GPU
+baseline. Weights are memory-mapped from the safetensors files (no copy in
+process memory), and each row is compared with the first budget of its own mode:
+
+| Budget | exact: GPU / streamed | exact tokens/s | fast: GPU / CPU | fast tokens/s | Output |
+|---|---|---|---|---|---|
+| 7 GB | 10 / 18 | 1.5 | 12 / 16 | **3.3** | identical |
+| 6 GB | 8 / 20 | 1.3 | 9 / 19 | **2.9** | identical |
+| 5 GB | 6 / 22 | 1.1 | — | — | identical |
+| 4 GB | 3 / 25 | 1.0 | — | — | identical |
+
+Here the limit is host RAM, not the bus: only ~16 layers (7 GB) can be pinned,
+and the rest are read from the page cache or disk. When the off-GPU layers do
+not fit in free RAM, `plan`, `run` and `bench` say so and show by how much.
+Fast mode at 5 and 4 GB was not run: the CPU layers would not fit in this
+machine's free RAM. Raw output is in `experiments/bench_7b_disk_*.txt`.
+
 Two honest caveats:
 
 - **The floor is set by what cannot be streamed.** Embeddings and the output
@@ -243,16 +291,19 @@ rather than failing later with an out-of-memory error.
 ```
 src/paramap/
 ├── residency.py      # budget planner + streaming runtime  <- the core
+├── loader.py         # memory-mapped safetensors loading (disk tier)
 ├── benchmark.py      # VRAM / tokens-per-second / output-identity measurement
 ├── cli.py            # paramap plan | run | bench
 ├── arch/             # per-architecture layer access (Qwen and Llama-style layouts)
 ├── device/           # hardware probe and real PCIe bandwidth measurement
-├── i18n/             # EN/TR message catalogue
+├── i18n/             # message catalogue used by the archived CLI
 └── legacy/           # archived earlier approach, see below
 tests/
 ├── test_residency.py # losslessness and budget-accounting invariants
+├── test_loader.py    # memory-mapped loading
 └── test_legacy.py    # keeps the archived work verifiable
-legacy/               # archived plans and experiments
+experiments/          # measurement scripts and their raw output
+legacy/               # archived plan and experiments
 ```
 
 Supported models: any causal LM whose decoder layers are a `ModuleList` under
@@ -294,4 +345,6 @@ If it ever fails, the runtime is no longer lossless.
 
 ---
 
-*Türkçe dokümantasyon: [README.tr.md](README.tr.md)*
+## License
+
+[MIT](LICENSE)
